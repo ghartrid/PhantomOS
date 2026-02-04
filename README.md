@@ -6,7 +6,7 @@ PhantomOS is an **experimental operating system simulation** exploring an altern
 
 **Note:** This is a user-space simulation/proof-of-concept written in C, not a bootable operating system kernel.
 
-![License](https://img.shields.io/badge/license-MIT-blue)
+![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-green)
 ![Language](https://img.shields.io/badge/language-C-orange)
 
@@ -109,7 +109,14 @@ Contributions welcome! Please ensure:
 
 ## License
 
-MIT License — See [LICENSE](LICENSE)
+**CC BY-NC-SA 4.0** (Creative Commons Attribution-NonCommercial-ShareAlike)
+
+- You can share and adapt this project
+- You must give credit and indicate changes
+- **You cannot sell or use commercially**
+- Derivatives must use the same license
+
+See [LICENSE](LICENSE) for full terms.
 
 ---
 
