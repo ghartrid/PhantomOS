@@ -1,0 +1,41 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#                        PHANTOM SAMPLE BLOCKLIST
+#                     "To Create, Not To Destroy"
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# This is a sample blocklist in hosts format.
+# Add your own blocklists from:
+#   - Steven Black's hosts: https://github.com/StevenBlack/hosts
+#   - URLhaus: https://urlhaus.abuse.ch/downloads/
+#   - PhishTank: https://phishtank.org/
+#
+# Format: 0.0.0.0 domain.com
+# Lines starting with # are comments
+
+# Known phishing domains (examples)
+0.0.0.0 secure-login-verify.com
+0.0.0.0 account-verify-secure.com
+0.0.0.0 paypa1-secure.com
+0.0.0.0 amaz0n-support.com
+0.0.0.0 micros0ft-verify.com
+0.0.0.0 g00gle-security.com
+0.0.0.0 apple-id-verify.tk
+0.0.0.0 netflix-payment-update.ml
+0.0.0.0 bank-verify-account.xyz
+
+# Malware distribution domains (examples)
+0.0.0.0 free-software-crack.com
+0.0.0.0 download-free-games.tk
+0.0.0.0 virus-free-download.ml
+0.0.0.0 cracked-apps-free.gq
+
+# Scam domains (examples)
+0.0.0.0 you-won-prize.com
+0.0.0.0 free-iphone-winner.com
+0.0.0.0 bitcoin-doubler-real.com
+0.0.0.0 get-rich-quick-system.xyz
+
+# Ad/tracking domains (small sample - use full lists for comprehensive blocking)
+0.0.0.0 tracking.malware-ads.com
+0.0.0.0 evil-analytics.com
+0.0.0.0 spy-tracker.net

@@ -1,0 +1,48 @@
+# Compiled binaries
+*.o
+*.a
+*.so
+phantom
+phantom-gui
+phantom-antimalware
+geofs
+
+# Build artifacts
+*.geo
+*.gcda
+*.gcno
+*.gcov
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+/tmp/
+*.log
+
+# Coverage reports
+coverage.info
+coverage-report/
+
+# Package builds
+*.deb
+*.rpm
+*.AppImage
+packaging/appimage/AppDir/
+packaging/appimage/*.AppImage
+
+# Local config
+.env
+*.local
+
+# Backup files
+*.bak
+*.orig

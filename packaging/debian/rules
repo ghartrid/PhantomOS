@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) -C kernel
+
+override_dh_auto_install:
+	# Create directories
+	install -d $(CURDIR)/debian/phantomos/usr/bin
+	install -d $(CURDIR)/debian/phantomos/usr/share/phantomos
+	install -d $(CURDIR)/debian/phantomos/usr/share/applications
+	install -d $(CURDIR)/debian/phantomos/usr/share/icons/hicolor/scalable/apps
+
+	# Install binaries
+	install -m 755 kernel/phantom-gui $(CURDIR)/debian/phantomos/usr/bin/
+	install -m 755 kernel/phantom $(CURDIR)/debian/phantomos/usr/bin/
+	install -m 755 kernel/phantom-antimalware $(CURDIR)/debian/phantomos/usr/bin/
+
+	# Install desktop files
+	install -m 644 packaging/phantomos.desktop $(CURDIR)/debian/phantomos/usr/share/applications/
+	install -m 644 packaging/phantomos-cli.desktop $(CURDIR)/debian/phantomos/usr/share/applications/
+	install -m 644 packaging/phantom-antimalware.desktop $(CURDIR)/debian/phantomos/usr/share/applications/
+
+	# Install icon
+	install -m 644 packaging/phantomos.svg $(CURDIR)/debian/phantomos/usr/share/icons/hicolor/scalable/apps/
+
+	# Install documentation
+	install -m 644 README.md $(CURDIR)/debian/phantomos/usr/share/phantomos/ || true
+
+override_dh_auto_clean:
+	$(MAKE) -C kernel clean || true
+
+override_dh_auto_test:
+	# Skip tests during package build

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PhantomOS CLI
+GenericName=PhantomOS Command Line
+Comment=PhantomOS command-line interface
+Exec=phantom shell
+Icon=phantomos
+Terminal=true
+Categories=System;Utility;TerminalEmulator;
+Keywords=phantom;shell;cli;terminal;

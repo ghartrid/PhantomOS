@@ -1,0 +1,39 @@
+Source: phantomos
+Section: utils
+Priority: optional
+Maintainer: PhantomOS Team <contact@phantomos.org>
+Build-Depends: debhelper (>= 10),
+               gcc,
+               make,
+               pkg-config,
+               libgtk-3-dev,
+               libwebkit2gtk-4.1-dev | libwebkit2gtk-4.0-dev,
+               libgstreamer1.0-dev,
+               libgstreamer-plugins-base1.0-dev,
+               libssl-dev,
+               libqrencode-dev
+Standards-Version: 4.5.0
+Homepage: https://github.com/phantomos/phantomos
+
+Package: phantomos
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libgtk-3-0,
+         libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37,
+         gstreamer1.0-plugins-base,
+         gstreamer1.0-plugins-good,
+         libssl3 | libssl1.1,
+         libqrencode4
+Recommends: gstreamer1.0-plugins-bad,
+            gstreamer1.0-plugins-ugly,
+            gstreamer1.0-libav
+Description: Geological file system with append-only storage
+ PhantomOS is an innovative operating system environment featuring:
+  - GeoFS: A geological file system where data is never deleted
+  - Governor: Capability-based security and code evaluation
+  - DNAuth: DNA-based authentication with evolution
+  - QRNet: Cryptographically-signed distributed file network
+  - Anti-Malware: Built-in security scanner
+ .
+ Philosophy: "To Create, Not To Destroy"

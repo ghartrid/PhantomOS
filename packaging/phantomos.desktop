@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PhantomOS
+GenericName=Operating System Environment
+Comment=A geological file system with append-only storage - To Create, Not To Destroy
+Exec=phantom-gui
+Icon=phantomos
+Terminal=false
+Categories=System;Utility;FileManager;
+Keywords=phantom;geology;filesystem;version;history;security;
+StartupNotify=true

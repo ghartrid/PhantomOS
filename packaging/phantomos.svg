@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00d4ff"/>
+      <stop offset="100%" style="stop-color:#0099cc"/>
+    </linearGradient>
+  </defs>
+  <!-- Background circle -->
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" stroke="#00d4ff" stroke-width="4"/>
+  <!-- Ghost body representing Phantom -->
+  <path d="M128 40 C70 40 50 90 50 130 C50 180 50 200 50 210
+           L70 195 L90 210 L110 195 L128 210 L146 195 L166 210 L186 195 L206 210
+           C206 200 206 180 206 130 C206 90 186 40 128 40 Z"
+        fill="url(#glow)" opacity="0.9"/>
+  <!-- Eyes -->
+  <ellipse cx="100" cy="110" rx="15" ry="20" fill="#1a1a2e"/>
+  <ellipse cx="156" cy="110" rx="15" ry="20" fill="#1a1a2e"/>
+  <!-- Eye highlights -->
+  <circle cx="105" cy="105" r="5" fill="#ffffff" opacity="0.8"/>
+  <circle cx="161" cy="105" r="5" fill="#ffffff" opacity="0.8"/>
+  <!-- Geology layers hint -->
+  <path d="M70 160 Q128 170 186 160" stroke="#1a1a2e" stroke-width="3" fill="none" opacity="0.5"/>
+  <path d="M75 175 Q128 185 181 175" stroke="#1a1a2e" stroke-width="2" fill="none" opacity="0.3"/>
+</svg>

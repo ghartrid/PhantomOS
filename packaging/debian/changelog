@@ -1,0 +1,12 @@
+phantomos (1.0.0-1) unstable; urgency=medium
+
+  * Initial release
+  * GeoFS geological file system with append-only storage
+  * Governor capability-based security system
+  * DNAuth DNA-based authentication
+  * QRNet distributed file network
+  * GTK3 graphical interface with WebKitGTK browser
+  * Built-in anti-malware scanner
+  * GStreamer-based media player
+
+ -- PhantomOS Team <contact@phantomos.org>  Thu, 30 Jan 2026 12:00:00 +0000

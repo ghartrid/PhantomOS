@@ -1,0 +1,15 @@
+# PhantomOS Deployment Configuration
+# Copy this file to ~/.phantomos-deploy.conf and customize
+
+# VPS Configuration
+# SECURITY: Never commit actual credentials to version control
+VPS_IP=""           # Your VPS IP address (e.g., "192.168.1.100")
+VPS_USER="deploy"   # Deployment user (use "deploy" not "root")
+
+# Local paths (optional - defaults shown)
+# PHANTOMOS_TARBALL="/home/youruser/Desktop/phantomos.tar.gz"
+# PHANTOMOS_SOURCE="/home/youruser/Desktop/phantomos"
+
+# SSH Options (optional)
+# SSH_KEY="~/.ssh/phantomos_deploy_key"
+# SSH_OPTIONS="-o StrictHostKeyChecking=yes"

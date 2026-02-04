@@ -1,0 +1,322 @@
+==6271== Memcheck, a memory error detector
+==6271== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.
+==6271== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==6271== Command: ./phantom demo
+==6271== 
+  Opened GeoFS volume: phantom.geo
+
+╔═══════════════════════════════════════════════════════╗
+║              PHANTOM KERNEL INITIALIZED               ║
+║                                                       ║
+║  The Prime Directive is active.                       ║
+║  All code must be Governor-approved.                  ║
+║  Destruction is architecturally impossible.           ║
+║                                                       ║
+║              "To Create, Not To Destroy"              ║
+╚═══════════════════════════════════════════════════════╝
+
+  [persist] Restored process 1 (hello_world) - state: dormant
+  [persist] Restored process 2 (compute_worker) - state: dormant
+  [persist] Restored process 3 (data_processor) - state: dormant
+  [persist] Restored process 4 (io_handler) - state: dormant
+  [persist] Restored process 5 (hello_world) - state: dormant
+  [persist] Restored process 6 (compute_worker) - state: dormant
+  [persist] Restored process 7 (data_processor) - state: dormant
+  [persist] Restored process 8 (io_handler) - state: dormant
+  [persist] Restored process 9 (hello_world) - state: dormant
+  [persist] Restored process 10 (compute_worker) - state: dormant
+  [persist] Restored process 11 (data_processor) - state: dormant
+  [persist] Restored process 12 (io_handler) - state: dormant
+  [persist] Restored process 13 (hello_world) - state: dormant
+  [persist] Restored process 14 (compute_worker) - state: dormant
+  [persist] Restored process 15 (data_processor) - state: dormant
+  [persist] Restored process 16 (io_handler) - state: dormant
+  [persist] Restored 16 processes from GeoFS
+
+=== Testing GOOD code (should be approved) ===
+
+  Process created: hello_world (PID 17)
+  Governor: Code analysis complete. No destructive operations detected.
+
+  SUCCESS: Process created with PID 17
+  [syscall] write: /hello.txt (15 bytes) by PID 17 -> c62e39a84c680977...
+  Process suspended: hello_world (PID 17)
+  Note: Process data preserved in geology. Nothing was destroyed.
+
+=== Testing BAD code (should be declined) ===
+
+
+╔═══════════════════════════════════════════════════════╗
+║              GOVERNOR DECLINED EXECUTION              ║
+╚═══════════════════════════════════════════════════════╝
+
+  Reasoning: Code contains destructive operations which are architecturally impossible in Phantom.
+  Alternatives: Use phantom_syscall_hide() instead of deletion operations.
+
+
+  CORRECT: Governor properly declined destructive code.
+
+=== Testing CORE SYSTEM features ===
+
+--- Creating processes for scheduler demo ---
+
+  Process created: compute_worker (PID 18)
+  Governor: Code analysis complete. No destructive operations detected.
+  Process created: data_processor (PID 19)
+  Governor: Code analysis complete. No destructive operations detected.
+  Process created: io_handler (PID 20)
+  Governor: Code analysis complete. No destructive operations detected.
+
+--- Setting priorities ---
+
+  [sched] PID 18 priority: 16 -> 10
+  [sched] PID 19 priority: 16 -> 20
+  [sched] PID 20 priority: 16 -> 25
+
+--- Running scheduler (5 cycles) ---
+
+  [sched] Initialized priority scheduler
+  [sched] Switch to PID 20 (io_handler) priority=25
+  [sched] Switch to PID 19 (data_processor) priority=20
+  [sched] Switch to PID 20 (io_handler) priority=25
+  [sched] Switch to PID 19 (data_processor) priority=20
+  [sched] Switch to PID 20 (io_handler) priority=25
+
+--- Testing IPC ---
+
+  [ipc] Message from PID 18 to PID 19 (type 0, 27 bytes)
+  Messages pending for PID 19: 1
+  [ipc] PID 19 received message from PID 18
+  Received: "Hello from compute_worker!"
+
+--- Testing Memory Management ---
+
+  [mem] Allocated 8192 bytes for PID 18 at 0x10000000 (flags=0x3)
+  [mem] Allocated 4096 bytes for PID 18 at 0x10002000 (flags=0x5)
+  [mem] Snapshot saved for PID 18 (2 regions)
+
+--- Testing Process Persistence ---
+
+  [persist] Saved process 20 (io_handler) to GeoFS
+  [persist] Saved process 19 (data_processor) to GeoFS
+  [persist] Saved process 18 (compute_worker) to GeoFS
+  [persist] Saved process 17 (hello_world) to GeoFS
+  [persist] Saved process 16 (io_handler) to GeoFS
+  [persist] Saved process 15 (data_processor) to GeoFS
+  [persist] Saved process 14 (compute_worker) to GeoFS
+  [persist] Saved process 13 (hello_world) to GeoFS
+  [persist] Saved process 12 (io_handler) to GeoFS
+  [persist] Saved process 11 (data_processor) to GeoFS
+  [persist] Saved process 10 (compute_worker) to GeoFS
+  [persist] Saved process 9 (hello_world) to GeoFS
+  [persist] Saved process 8 (io_handler) to GeoFS
+  [persist] Saved process 7 (data_processor) to GeoFS
+  [persist] Saved process 6 (compute_worker) to GeoFS
+  [persist] Saved process 5 (hello_world) to GeoFS
+  [persist] Saved process 4 (io_handler) to GeoFS
+  [persist] Saved process 3 (data_processor) to GeoFS
+  [persist] Saved process 2 (compute_worker) to GeoFS
+  [persist] Saved process 1 (hello_world) to GeoFS
+  [persist] Saved 20 processes to GeoFS
+
+--- Scheduler Statistics ---
+
+  PID 20 stats:
+    Priority:    25
+    Total time:  4386997 ns
+    Wakeups:     3
+
+--- Suspending demo processes ---
+
+  Process suspended: compute_worker (PID 18)
+  Note: Process data preserved in geology. Nothing was destroyed.
+  Process suspended: data_processor (PID 19)
+  Note: Process data preserved in geology. Nothing was destroyed.
+  Process suspended: io_handler (PID 20)
+  Note: Process data preserved in geology. Nothing was destroyed.
+
+=== Testing VIRTUAL FILE SYSTEM ===
+
+  [vfs] Virtual File System initialized
+  [vfs] Root dentry created
+--- Registering filesystems ---
+
+  [vfs] Registered filesystem: procfs
+  [vfs] Registered filesystem: devfs
+
+--- Mounting filesystems ---
+
+  [procfs] Mounted process filesystem
+  [vfs] Mounted none on /proc (type: procfs)
+  [devfs] Mounted device filesystem
+  [devfs] Available devices: null, zero, full, random, urandom, console, tty, kmsg
+  [vfs] Mounted none on /dev (type: devfs)
+
+--- Testing /dev/null ---
+
+  Wrote 22 bytes to /dev/null (discarded)
+  Read 0 bytes from /dev/null (EOF)
+
+--- Testing /dev/zero ---
+
+  Read 16 bytes from /dev/zero: (all zeros)
+
+--- Testing /dev/random ---
+
+  Read 8 bytes from /dev/random: ea1fb65969294e13
+
+--- Testing /dev/console ---
+
+  Hello from /dev/console!
+--- Testing mkdir ---
+
+  [vfs] Created directory: /data
+  Created /data directory
+  [vfs] Created directory: /data/logs
+  Created /data/logs directory
+
+--- Testing symlinks ---
+
+
+--- Testing stat ---
+
+  /dev/null: inode=0, type=3, size=22
+
+--- Testing hide (Phantom's delete) ---
+
+  [vfs] Created directory: /temp
+  Created /temp directory
+  [vfs] Hidden: /temp (preserved in geology)
+  Hidden /temp (still preserved in geology)
+
+--- VFS Statistics ---
+
+  [vfs] Shutdown complete
+  [vfs] Statistics:
+    Total opens:         4
+    Total reads:         2
+    Total writes:        2
+    Total bytes read:    24
+    Total bytes written: 49
+
+=== Process Table (includes dormant - nothing is ever deleted) ===
+
+  PID 20    dormant     io_handler            c49183c2c35e3ac9...
+  PID 19    dormant     data_processor        4319a26d848d95ff...
+  PID 18    dormant     compute_worker        bc12f203d0560829...
+  PID 17    dormant     hello_world           f4d66ea02be06a64...
+  PID 16    dormant     io_handler            c49183c2c35e3ac9...
+  PID 15    dormant     data_processor        4319a26d848d95ff...
+  PID 14    dormant     compute_worker        bc12f203d0560829...
+  PID 13    dormant     hello_world           f4d66ea02be06a64...
+  PID 12    dormant     io_handler            c49183c2c35e3ac9...
+  PID 11    dormant     data_processor        4319a26d848d95ff...
+  PID 10    dormant     compute_worker        bc12f203d0560829...
+  PID 9     dormant     hello_world           f4d66ea02be06a64...
+  PID 8     dormant     io_handler            c49183c2c35e3ac9...
+  PID 7     dormant     data_processor        4319a26d848d95ff...
+  PID 6     dormant     compute_worker        bc12f203d0560829...
+  PID 5     dormant     hello_world           f4d66ea02be06a64...
+  PID 4     dormant     io_handler            c49183c2c35e3ac9...
+  PID 3     dormant     data_processor        4319a26d848d95ff...
+  PID 2     dormant     compute_worker        bc12f203d0560829...
+  PID 1     dormant     hello_world           f4d66ea02be06a64...
+
+  Total: 20 processes (0 active, 20 dormant)
+  [persist] Saved process 20 (io_handler) to GeoFS
+  [persist] Saved process 19 (data_processor) to GeoFS
+  [persist] Saved process 18 (compute_worker) to GeoFS
+  [persist] Saved process 17 (hello_world) to GeoFS
+  [persist] Saved process 16 (io_handler) to GeoFS
+  [persist] Saved process 15 (data_processor) to GeoFS
+  [persist] Saved process 14 (compute_worker) to GeoFS
+  [persist] Saved process 13 (hello_world) to GeoFS
+  [persist] Saved process 12 (io_handler) to GeoFS
+  [persist] Saved process 11 (data_processor) to GeoFS
+  [persist] Saved process 10 (compute_worker) to GeoFS
+  [persist] Saved process 9 (hello_world) to GeoFS
+  [persist] Saved process 8 (io_handler) to GeoFS
+  [persist] Saved process 7 (data_processor) to GeoFS
+  [persist] Saved process 6 (compute_worker) to GeoFS
+  [persist] Saved process 5 (hello_world) to GeoFS
+  [persist] Saved process 4 (io_handler) to GeoFS
+  [persist] Saved process 3 (data_processor) to GeoFS
+  [persist] Saved process 2 (compute_worker) to GeoFS
+  [persist] Saved process 1 (hello_world) to GeoFS
+  [persist] Saved 20 processes to GeoFS
+
+╔═══════════════════════════════════════════════════════╗
+║              PHANTOM KERNEL SHUTDOWN                  ║
+║                                                       ║
+║  All processes suspended (not destroyed).             ║
+║  All data preserved in geology.                       ║
+║  Nothing was lost. Nothing was forgotten.             ║
+╚═══════════════════════════════════════════════════════╝
+
+  Statistics (permanent record):
+    Total processes ever:    20
+    Total syscalls:          1
+    Total bytes created:     15
+    Total messages sent:     1
+    Context switches:        5
+    Code evaluated:          5
+    Code approved:           4
+    Code declined:           1
+
+==6271== 
+==6271== HEAP SUMMARY:
+==6271==     in use at exit: 49,184 bytes in 61 blocks
+==6271==   total heap usage: 419 allocs, 358 frees, 1,021,016 bytes allocated
+==6271== 
+==6271== 64 bytes in 1 blocks are definitely lost in loss record 7 of 46
+==6271==    at 0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6271==    by 0x11554B: vfs_open (vfs.c:591)
+==6271==    by 0x110B54: demo_vfs (phantom.c:1401)
+==6271==    by 0x1101E3: main (phantom.c:1658)
+==6271== 
+==6271== 64 bytes in 1 blocks are definitely lost in loss record 8 of 46
+==6271==    at 0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6271==    by 0x11554B: vfs_open (vfs.c:591)
+==6271==    by 0x110BE5: demo_vfs (phantom.c:1416)
+==6271==    by 0x1101E3: main (phantom.c:1658)
+==6271== 
+==6271== 64 bytes in 1 blocks are definitely lost in loss record 9 of 46
+==6271==    at 0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6271==    by 0x11554B: vfs_open (vfs.c:591)
+==6271==    by 0x110C18: demo_vfs (phantom.c:1431)
+==6271==    by 0x1101E3: main (phantom.c:1658)
+==6271== 
+==6271== 64 bytes in 1 blocks are definitely lost in loss record 10 of 46
+==6271==    at 0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6271==    by 0x11554B: vfs_open (vfs.c:591)
+==6271==    by 0x110C4B: demo_vfs (phantom.c:1445)
+==6271==    by 0x1101E3: main (phantom.c:1658)
+==6271== 
+==6271== 4,096 bytes in 1 blocks are definitely lost in loss record 39 of 46
+==6271==    at 0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6271==    by 0x11382E: phantom_mem_alloc (phantom.c:945)
+==6271==    by 0x110117: demo_core_system (phantom.c:1302)
+==6271==    by 0x110117: main (phantom.c:1657)
+==6271== 
+==6271== 14,080 (312 direct, 13,768 indirect) bytes in 1 blocks are definitely lost in loss record 45 of 46
+==6271==    at 0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6271==    by 0x114AAB: dentry_alloc (vfs.c:172)
+==6271==    by 0x114AAB: vfs_init (vfs.c:266)
+==6271==    by 0x110A7E: demo_vfs (phantom.c:1378)
+==6271==    by 0x1101E3: main (phantom.c:1658)
+==6271== 
+==6271== 30,752 (872 direct, 29,880 indirect) bytes in 1 blocks are definitely lost in loss record 46 of 46
+==6271==    at 0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_memcheck-amd64-linux.so)
+==6271==    by 0x111C3F: phantom_process_create (phantom.c:421)
+==6271==    by 0x10FFDD: demo_core_system (phantom.c:1267)
+==6271==    by 0x10FFDD: main (phantom.c:1657)
+==6271== 
+==6271== LEAK SUMMARY:
+==6271==    definitely lost: 5,536 bytes in 7 blocks
+==6271==    indirectly lost: 43,648 bytes in 54 blocks
+==6271==      possibly lost: 0 bytes in 0 blocks
+==6271==    still reachable: 0 bytes in 0 blocks
+==6271==         suppressed: 0 bytes in 0 blocks
+==6271== 
+==6271== For lists of detected and suppressed errors, rerun with: -s
+==6271== ERROR SUMMARY: 7 errors from 7 contexts (suppressed: 0 from 0)
