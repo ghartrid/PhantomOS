@@ -73,6 +73,8 @@ typedef struct {
     uint8_t scrambled_data[MUSIKEY_MAX_SONG_LENGTH * sizeof(musikey_event_t)];
     uint32_t data_size;
     uint8_t salt[MUSIKEY_SALT_SIZE];
+    uint8_t iv[12];                                 /* AES-GCM initialization vector */
+    uint8_t auth_tag[16];                          /* AES-GCM authentication tag */
     uint8_t verification_hash[MUSIKEY_HASH_SIZE];  /* Hash of original for verify */
     uint32_t scramble_iterations;
 } musikey_scrambled_t;

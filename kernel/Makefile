@@ -170,7 +170,7 @@ phantom_qrnet_transport.o: phantom_qrnet_transport.c phantom_qrnet_transport.h p
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 phantom_musikey.o: phantom_musikey.c phantom_musikey.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
 
 demo: $(KERNEL_BIN)
 	./$(KERNEL_BIN) demo
