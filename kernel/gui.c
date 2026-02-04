@@ -33,6 +33,7 @@
 #include "phantom_dnauth.h"
 #include "phantom_qrnet.h"
 #include "phantom_qrnet_transport.h"
+#include "phantom_musikey.h"
 #ifdef HAVE_GSTREAMER
 #include "phantom_mediaplayer.h"
 #endif
@@ -613,15 +614,16 @@ int phantom_gui_init(phantom_gui_t *gui,
         "🎨 ArtOS",
         "👥 Users",
         "🧬 DNAuth",
+        "🎹 MusiKey",
         "📡 QRNet",
         "📦 PhantomPods",
         "💾 Backup",
         "🧪 Desktop Lab"
     };
     const char *sidebar_names[] = {
-        "desktop", "files", "processes", "services", "governor", "geology", "terminal", "constitution", "ai", "network", "apps", "security", "media", "artos", "users", "dnauth", "qrnet", "pods", "backup", "desktoplab"
+        "desktop", "files", "processes", "services", "governor", "geology", "terminal", "constitution", "ai", "network", "apps", "security", "media", "artos", "users", "dnauth", "musikey", "qrnet", "pods", "backup", "desktoplab"
     };
-    const int sidebar_count = 20;
+    const int sidebar_count = 21;
 #else
     const char *sidebar_items[] = {
         "🏠 Desktop",
@@ -639,15 +641,16 @@ int phantom_gui_init(phantom_gui_t *gui,
         "🎨 ArtOS",
         "👥 Users",
         "🧬 DNAuth",
+        "🎹 MusiKey",
         "📡 QRNet",
         "📦 PhantomPods",
         "💾 Backup",
         "🧪 Desktop Lab"
     };
     const char *sidebar_names[] = {
-        "desktop", "files", "processes", "services", "governor", "geology", "terminal", "constitution", "ai", "network", "apps", "security", "artos", "users", "dnauth", "qrnet", "pods", "backup", "desktoplab"
+        "desktop", "files", "processes", "services", "governor", "geology", "terminal", "constitution", "ai", "network", "apps", "security", "artos", "users", "dnauth", "musikey", "qrnet", "pods", "backup", "desktoplab"
     };
-    const int sidebar_count = 19;
+    const int sidebar_count = 20;
 #endif
 
     GtkWidget *first_button = NULL;
@@ -736,6 +739,10 @@ int phantom_gui_init(phantom_gui_t *gui,
     /* Backup - Data Preservation */
     gui->backup_panel = phantom_gui_create_backup_panel(gui);
     gtk_stack_add_named(GTK_STACK(gui->content_stack), gui->backup_panel, "backup");
+
+    /* MusiKey - Musical Authentication */
+    gui->musikey_panel = phantom_gui_create_musikey_panel(gui);
+    gtk_stack_add_named(GTK_STACK(gui->content_stack), gui->musikey_panel, "musikey");
 
     /* Desktop Lab - Widgets & Experimental Features */
     gui->desktop_lab_panel = phantom_gui_create_desktop_lab_panel(gui);
@@ -11306,4 +11313,520 @@ void phantom_gui_refresh_backup(phantom_gui_t *gui) {
         }
         gtk_label_set_text(GTK_LABEL(gui->backup_size_label), size_info);
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ *                         MUSIKEY PANEL
+ *                    Musical Authentication System
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Forward declarations */
+static void on_musikey_enroll_clicked(GtkWidget *button, phantom_gui_t *gui);
+static void on_musikey_auth_clicked(GtkWidget *button, phantom_gui_t *gui);
+static void on_musikey_play_clicked(GtkWidget *button, phantom_gui_t *gui);
+static gboolean on_musikey_piano_draw(GtkWidget *widget, cairo_t *cr, phantom_gui_t *gui);
+static gboolean on_musikey_visualizer_draw(GtkWidget *widget, cairo_t *cr, phantom_gui_t *gui);
+static gboolean on_musikey_animation_tick(phantom_gui_t *gui);
+static void on_musikey_selection_changed(GtkTreeSelection *selection, phantom_gui_t *gui);
+
+/* List store columns */
+enum {
+    MUSIKEY_COL_USERNAME,
+    MUSIKEY_COL_ENTROPY,
+    MUSIKEY_COL_CREATED,
+    MUSIKEY_COL_STATUS,
+    MUSIKEY_COL_NUM
+};
+
+/* Piano key black pattern */
+static const int MUSIKEY_BLACK_PATTERN[] = {0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0};
+
+/* Create MusiKey panel */
+GtkWidget *phantom_gui_create_musikey_panel(phantom_gui_t *gui) {
+    GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(main_box), 8);
+
+    /* Title */
+    GtkWidget *title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title),
+        "<span size='large' weight='bold'>🎹 MusiKey - Musical Authentication</span>\n"
+        "<span size='small'>Secure authentication through unique musical compositions</span>");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(main_box), title, FALSE, FALSE, 8);
+
+    /* Initialize MusiKey system */
+    musikey_init(NULL);
+    gui->musikey_system = NULL;  /* Will be set per-user */
+    gui->musikey_current_song = NULL;
+    gui->musikey_playing = 0;
+
+    /* Initialize visualization arrays */
+    for (int i = 0; i < 25; i++) gui->musikey_piano_highlights[i] = 0.0f;
+    for (int i = 0; i < 32; i++) gui->musikey_vis_bars[i] = 0.1f;
+
+    /* Status label */
+    gui->musikey_status_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+        "<span color='#3fb950'>● MusiKey System Ready</span>");
+    gtk_widget_set_halign(gui->musikey_status_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(main_box), gui->musikey_status_label, FALSE, FALSE, 4);
+
+    /* Main content paned */
+    GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_paned_set_position(GTK_PANED(paned), 250);
+    gtk_box_pack_start(GTK_BOX(main_box), paned, TRUE, TRUE, 0);
+
+    /* Left side - User list */
+    GtkWidget *left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_paned_pack1(GTK_PANED(paned), left_box, FALSE, FALSE);
+
+    GtkWidget *users_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(users_label), "<b>Enrolled Users</b>");
+    gtk_widget_set_halign(users_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(left_box), users_label, FALSE, FALSE, 4);
+
+    /* User list */
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(left_box), scroll, TRUE, TRUE, 0);
+
+    gui->musikey_users_store = gtk_list_store_new(MUSIKEY_COL_NUM,
+        G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+    gui->musikey_users_tree = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(gui->musikey_users_store));
+
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_append_column(GTK_TREE_VIEW(gui->musikey_users_tree),
+        gtk_tree_view_column_new_with_attributes("User", renderer, "text", MUSIKEY_COL_USERNAME, NULL));
+    gtk_tree_view_append_column(GTK_TREE_VIEW(gui->musikey_users_tree),
+        gtk_tree_view_column_new_with_attributes("Entropy", renderer, "text", MUSIKEY_COL_ENTROPY, NULL));
+    gtk_tree_view_append_column(GTK_TREE_VIEW(gui->musikey_users_tree),
+        gtk_tree_view_column_new_with_attributes("Status", renderer, "text", MUSIKEY_COL_STATUS, NULL));
+
+    GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(gui->musikey_users_tree));
+    g_signal_connect(selection, "changed", G_CALLBACK(on_musikey_selection_changed), gui);
+
+    gtk_container_add(GTK_CONTAINER(scroll), gui->musikey_users_tree);
+
+    /* Right side - Main interface */
+    GtkWidget *right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(right_box), 8);
+    gtk_paned_pack2(GTK_PANED(paned), right_box, TRUE, FALSE);
+
+    /* Input fields */
+    GtkWidget *input_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(input_grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(input_grid), 8);
+    gtk_box_pack_start(GTK_BOX(right_box), input_grid, FALSE, FALSE, 0);
+
+    GtkWidget *user_label = gtk_label_new("Username:");
+    gtk_widget_set_halign(user_label, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(input_grid), user_label, 0, 0, 1, 1);
+
+    gui->musikey_username_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(gui->musikey_username_entry), "Enter username");
+    gtk_widget_set_hexpand(gui->musikey_username_entry, TRUE);
+    gtk_grid_attach(GTK_GRID(input_grid), gui->musikey_username_entry, 1, 0, 1, 1);
+
+    GtkWidget *pass_label = gtk_label_new("Passphrase:");
+    gtk_widget_set_halign(pass_label, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(input_grid), pass_label, 0, 1, 1, 1);
+
+    gui->musikey_passphrase_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(gui->musikey_passphrase_entry), "Enter passphrase key");
+    gtk_entry_set_visibility(GTK_ENTRY(gui->musikey_passphrase_entry), FALSE);
+    gtk_widget_set_hexpand(gui->musikey_passphrase_entry, TRUE);
+    gtk_grid_attach(GTK_GRID(input_grid), gui->musikey_passphrase_entry, 1, 1, 1, 1);
+
+    /* Buttons */
+    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(right_box), button_box, FALSE, FALSE, 0);
+
+    gui->musikey_enroll_btn = gtk_button_new_with_label("🎵 Enroll");
+    gtk_widget_set_tooltip_text(gui->musikey_enroll_btn, "Generate unique musical key and enroll user");
+    g_signal_connect(gui->musikey_enroll_btn, "clicked", G_CALLBACK(on_musikey_enroll_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(button_box), gui->musikey_enroll_btn, FALSE, FALSE, 0);
+
+    gui->musikey_auth_btn = gtk_button_new_with_label("🔐 Authenticate");
+    gtk_widget_set_tooltip_text(gui->musikey_auth_btn, "Verify passphrase against enrolled musical key");
+    gtk_widget_set_sensitive(gui->musikey_auth_btn, FALSE);
+    g_signal_connect(gui->musikey_auth_btn, "clicked", G_CALLBACK(on_musikey_auth_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(button_box), gui->musikey_auth_btn, FALSE, FALSE, 0);
+
+    gui->musikey_play_btn = gtk_button_new_with_label("▶ Play Preview");
+    gtk_widget_set_tooltip_text(gui->musikey_play_btn, "Play the generated musical composition");
+    gtk_widget_set_sensitive(gui->musikey_play_btn, FALSE);
+    g_signal_connect(gui->musikey_play_btn, "clicked", G_CALLBACK(on_musikey_play_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(button_box), gui->musikey_play_btn, FALSE, FALSE, 0);
+
+    /* Entropy display */
+    gui->musikey_entropy_label = gtk_label_new("Entropy: -- bits");
+    gtk_widget_set_halign(gui->musikey_entropy_label, GTK_ALIGN_END);
+    gtk_box_pack_start(GTK_BOX(button_box), gui->musikey_entropy_label, TRUE, TRUE, 0);
+
+    /* Visualizer */
+    GtkWidget *vis_frame = gtk_frame_new("Audio Visualizer");
+    gtk_box_pack_start(GTK_BOX(right_box), vis_frame, FALSE, FALSE, 0);
+
+    gui->musikey_visualizer_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(gui->musikey_visualizer_area, -1, 60);
+    g_signal_connect(gui->musikey_visualizer_area, "draw", G_CALLBACK(on_musikey_visualizer_draw), gui);
+    gtk_container_add(GTK_CONTAINER(vis_frame), gui->musikey_visualizer_area);
+
+    /* Piano */
+    GtkWidget *piano_frame = gtk_frame_new("Piano Keyboard");
+    gtk_box_pack_start(GTK_BOX(right_box), piano_frame, FALSE, FALSE, 0);
+
+    gui->musikey_piano_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(gui->musikey_piano_area, -1, 80);
+    g_signal_connect(gui->musikey_piano_area, "draw", G_CALLBACK(on_musikey_piano_draw), gui);
+    gtk_container_add(GTK_CONTAINER(piano_frame), gui->musikey_piano_area);
+
+    /* Info text */
+    GtkWidget *info_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(info_label),
+        "<span size='small' color='#8b949e'>MusiKey generates a unique musical composition for each user. "
+        "The composition is scrambled with your passphrase and stored securely. "
+        "Authentication verifies that descrambling produces valid music.</span>");
+    gtk_label_set_line_wrap(GTK_LABEL(info_label), TRUE);
+    gtk_widget_set_halign(info_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), info_label, FALSE, FALSE, 8);
+
+    /* Start animation timer */
+    gui->musikey_anim_timer = g_timeout_add(50, (GSourceFunc)on_musikey_animation_tick, gui);
+
+    return main_box;
+}
+
+/* Draw piano keyboard */
+static gboolean on_musikey_piano_draw(GtkWidget *widget, cairo_t *cr, phantom_gui_t *gui) {
+    int width = gtk_widget_get_allocated_width(widget);
+    int height = gtk_widget_get_allocated_height(widget);
+
+    /* Background */
+    cairo_set_source_rgb(cr, 0.1, 0.1, 0.15);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    int white_width = width / 15;
+    int black_width = white_width * 2 / 3;
+    int white_x = 0;
+    int key_idx = 0;
+
+    /* Draw white keys */
+    for (int octave = 0; octave < 2; octave++) {
+        for (int note = 0; note < 7; note++) {
+            /* Map to chromatic index */
+            int chromatic[] = {0, 2, 4, 5, 7, 9, 11};
+            int idx = octave * 12 + chromatic[note];
+            if (idx >= 25) break;
+
+            float h = gui->musikey_piano_highlights[idx];
+            if (h > 0) {
+                cairo_set_source_rgb(cr, 0.3 + 0.5*h, 0.9, 0.6 + 0.2*h);
+            } else {
+                cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
+            }
+
+            cairo_rectangle(cr, white_x + 1, 2, white_width - 2, height - 4);
+            cairo_fill(cr);
+
+            /* Border */
+            cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+            cairo_set_line_width(cr, 1);
+            cairo_rectangle(cr, white_x + 1, 2, white_width - 2, height - 4);
+            cairo_stroke(cr);
+
+            white_x += white_width;
+            key_idx++;
+        }
+    }
+    /* Add final C */
+    float h = gui->musikey_piano_highlights[24];
+    if (h > 0) {
+        cairo_set_source_rgb(cr, 0.3 + 0.5*h, 0.9, 0.6 + 0.2*h);
+    } else {
+        cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
+    }
+    cairo_rectangle(cr, white_x + 1, 2, white_width - 2, height - 4);
+    cairo_fill(cr);
+    cairo_set_source_rgb(cr, 0.3, 0.3, 0.3);
+    cairo_rectangle(cr, white_x + 1, 2, white_width - 2, height - 4);
+    cairo_stroke(cr);
+
+    /* Draw black keys */
+    white_x = 0;
+    for (int octave = 0; octave < 2; octave++) {
+        for (int note = 0; note < 7; note++) {
+            int chromatic[] = {0, 2, 4, 5, 7, 9, 11};
+            int idx = octave * 12 + chromatic[note];
+            if (idx >= 24) break;
+
+            /* Check if there's a black key after this white key */
+            if (note != 2 && note != 6) {
+                int black_idx = idx + 1;
+                float bh = gui->musikey_piano_highlights[black_idx];
+
+                int black_x = white_x + white_width - black_width/2;
+
+                if (bh > 0) {
+                    cairo_set_source_rgb(cr, 0.3 + 0.5*bh, 0.8, 0.5 + 0.3*bh);
+                } else {
+                    cairo_set_source_rgb(cr, 0.15, 0.15, 0.15);
+                }
+
+                cairo_rectangle(cr, black_x, 2, black_width, height * 2/3);
+                cairo_fill(cr);
+            }
+
+            white_x += white_width;
+        }
+    }
+
+    return TRUE;
+}
+
+/* Draw audio visualizer */
+static gboolean on_musikey_visualizer_draw(GtkWidget *widget, cairo_t *cr, phantom_gui_t *gui) {
+    int width = gtk_widget_get_allocated_width(widget);
+    int height = gtk_widget_get_allocated_height(widget);
+
+    /* Background */
+    cairo_set_source_rgb(cr, 0.08, 0.1, 0.15);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    int bar_width = width / 32;
+
+    for (int i = 0; i < 32; i++) {
+        int bar_height = (int)(gui->musikey_vis_bars[i] * (height - 4));
+        if (bar_height < 2) bar_height = 2;
+
+        /* Gradient color based on height */
+        float t = gui->musikey_vis_bars[i];
+        cairo_set_source_rgb(cr, 0.3 + 0.6*t, 0.9 - 0.3*t, 0.5);
+
+        cairo_rectangle(cr, i * bar_width + 1, height - bar_height - 2,
+                        bar_width - 2, bar_height);
+        cairo_fill(cr);
+    }
+
+    return TRUE;
+}
+
+/* Animation tick */
+static gboolean on_musikey_animation_tick(phantom_gui_t *gui) {
+    if (!gui) return FALSE;
+
+    /* Decay piano highlights */
+    int needs_redraw = 0;
+    for (int i = 0; i < 25; i++) {
+        if (gui->musikey_piano_highlights[i] > 0.01f) {
+            gui->musikey_piano_highlights[i] *= 0.9f;
+            needs_redraw = 1;
+        } else {
+            gui->musikey_piano_highlights[i] = 0;
+        }
+    }
+
+    /* Decay visualizer bars */
+    for (int i = 0; i < 32; i++) {
+        if (gui->musikey_vis_bars[i] > 0.1f) {
+            gui->musikey_vis_bars[i] *= 0.95f;
+            needs_redraw = 1;
+        } else {
+            gui->musikey_vis_bars[i] = 0.1f;
+        }
+    }
+
+    /* Redraw if needed */
+    if (needs_redraw) {
+        if (gui->musikey_piano_area)
+            gtk_widget_queue_draw(gui->musikey_piano_area);
+        if (gui->musikey_visualizer_area)
+            gtk_widget_queue_draw(gui->musikey_visualizer_area);
+    }
+
+    return TRUE;
+}
+
+/* Enroll button clicked */
+static void on_musikey_enroll_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+
+    const char *username = gtk_entry_get_text(GTK_ENTRY(gui->musikey_username_entry));
+    const char *passphrase = gtk_entry_get_text(GTK_ENTRY(gui->musikey_passphrase_entry));
+
+    if (!username || strlen(username) == 0) {
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#f85149'>● Error: Enter a username</span>");
+        return;
+    }
+
+    if (!passphrase || strlen(passphrase) < 8) {
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#f85149'>● Error: Passphrase must be at least 8 characters</span>");
+        return;
+    }
+
+    /* Create credential */
+    musikey_credential_t *cred = malloc(sizeof(musikey_credential_t));
+    if (!cred) return;
+
+    musikey_error_t err = musikey_enroll(username,
+                                          (const uint8_t*)passphrase, strlen(passphrase),
+                                          cred);
+
+    if (err == MUSIKEY_OK) {
+        /* Store credential */
+        if (gui->musikey_system) free(gui->musikey_system);
+        gui->musikey_system = cred;
+
+        /* Get the song for visualization */
+        if (gui->musikey_current_song) free(gui->musikey_current_song);
+        gui->musikey_current_song = malloc(sizeof(musikey_song_t));
+        if (gui->musikey_current_song) {
+            musikey_descramble(&cred->scrambled_song,
+                              (const uint8_t*)passphrase, strlen(passphrase),
+                              (musikey_song_t*)gui->musikey_current_song);
+
+            musikey_song_t *song = (musikey_song_t*)gui->musikey_current_song;
+
+            /* Update entropy display */
+            char entropy_str[64];
+            snprintf(entropy_str, sizeof(entropy_str), "Entropy: %u bits", song->entropy_bits);
+            gtk_label_set_text(GTK_LABEL(gui->musikey_entropy_label), entropy_str);
+
+            /* Trigger visualization */
+            for (uint32_t i = 0; i < song->event_count && i < 25; i++) {
+                int key = song->events[i].note % 25;
+                gui->musikey_piano_highlights[key] = 1.0f;
+
+                int bar = (song->events[i].note - 48) * 32 / 24;
+                if (bar >= 0 && bar < 32) {
+                    gui->musikey_vis_bars[bar] = song->events[i].velocity / 127.0f;
+                }
+            }
+        }
+
+        /* Add to list */
+        GtkTreeIter iter;
+        gtk_list_store_append(gui->musikey_users_store, &iter);
+        gtk_list_store_set(gui->musikey_users_store, &iter,
+            MUSIKEY_COL_USERNAME, username,
+            MUSIKEY_COL_ENTROPY, "~100 bits",
+            MUSIKEY_COL_CREATED, "Just now",
+            MUSIKEY_COL_STATUS, "Active",
+            -1);
+
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#3fb950'>● Enrollment successful! Musical key generated.</span>");
+
+        gtk_widget_set_sensitive(gui->musikey_auth_btn, TRUE);
+        gtk_widget_set_sensitive(gui->musikey_play_btn, TRUE);
+
+    } else {
+        free(cred);
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#f85149'>● Enrollment failed</span>");
+    }
+}
+
+/* Authenticate button clicked */
+static void on_musikey_auth_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+
+    if (!gui->musikey_system) {
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#f85149'>● No user enrolled</span>");
+        return;
+    }
+
+    const char *passphrase = gtk_entry_get_text(GTK_ENTRY(gui->musikey_passphrase_entry));
+
+    musikey_error_t err = musikey_authenticate(
+        (musikey_credential_t*)gui->musikey_system,
+        (const uint8_t*)passphrase, strlen(passphrase));
+
+    if (err == MUSIKEY_OK) {
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#3fb950'>● Authentication SUCCESS! Musical key verified.</span>");
+
+        /* Success visualization */
+        for (int i = 0; i < 25; i++) {
+            gui->musikey_piano_highlights[i] = 1.0f;
+        }
+        for (int i = 0; i < 32; i++) {
+            gui->musikey_vis_bars[i] = 0.8f;
+        }
+
+    } else if (err == MUSIKEY_ERR_LOCKED) {
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#f85149'>● Account LOCKED - Too many failed attempts</span>");
+        gtk_widget_set_sensitive(gui->musikey_auth_btn, FALSE);
+
+    } else {
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#f85149'>● Authentication FAILED - Wrong passphrase</span>");
+
+        /* Failure visualization - random noise */
+        for (int i = 0; i < 32; i++) {
+            gui->musikey_vis_bars[i] = 0.2f + (rand() % 30) / 100.0f;
+        }
+    }
+}
+
+/* Play preview button clicked */
+static void on_musikey_play_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+
+    if (!gui->musikey_current_song) {
+        gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+            "<span color='#f85149'>● No song to play - enroll first</span>");
+        return;
+    }
+
+    musikey_song_t *song = (musikey_song_t*)gui->musikey_current_song;
+
+    /* Animate through the song events */
+    for (uint32_t i = 0; i < song->event_count && i < 25; i++) {
+        int key = song->events[i].note % 25;
+        gui->musikey_piano_highlights[key] = 1.0f;
+
+        int bar = i * 32 / song->event_count;
+        if (bar < 32) {
+            gui->musikey_vis_bars[bar] = song->events[i].velocity / 127.0f;
+        }
+    }
+
+    gtk_label_set_markup(GTK_LABEL(gui->musikey_status_label),
+        "<span color='#58a6ff'>♪ Playing musical preview...</span>");
+}
+
+/* User selection changed */
+static void on_musikey_selection_changed(GtkTreeSelection *selection, phantom_gui_t *gui) {
+    GtkTreeIter iter;
+    GtkTreeModel *model;
+
+    if (gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        gchar *username;
+        gtk_tree_model_get(model, &iter, MUSIKEY_COL_USERNAME, &username, -1);
+
+        gtk_entry_set_text(GTK_ENTRY(gui->musikey_username_entry), username);
+        gtk_widget_set_sensitive(gui->musikey_auth_btn, TRUE);
+
+        g_free(username);
+    }
+}
+
+/* Refresh MusiKey panel */
+void phantom_gui_refresh_musikey(phantom_gui_t *gui) {
+    if (!gui) return;
+
+    /* Redraw visualizations */
+    if (gui->musikey_piano_area)
+        gtk_widget_queue_draw(gui->musikey_piano_area);
+    if (gui->musikey_visualizer_area)
+        gtk_widget_queue_draw(gui->musikey_visualizer_area);
 }

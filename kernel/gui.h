@@ -226,6 +226,26 @@ typedef struct phantom_gui {
     GtkWidget *pods_run_btn;
     void *pod_system;                      /* phantom_pod_system_t* */
 
+    /* MusiKey widgets (Musical Authentication) */
+    GtkWidget *musikey_panel;
+    GtkWidget *musikey_piano_area;         /* Piano keyboard drawing area */
+    GtkWidget *musikey_visualizer_area;    /* Audio visualizer */
+    GtkWidget *musikey_username_entry;     /* Username input */
+    GtkWidget *musikey_passphrase_entry;   /* Passphrase input */
+    GtkWidget *musikey_enroll_btn;         /* Enroll button */
+    GtkWidget *musikey_auth_btn;           /* Authenticate button */
+    GtkWidget *musikey_play_btn;           /* Play preview button */
+    GtkWidget *musikey_status_label;       /* Status display */
+    GtkWidget *musikey_entropy_label;      /* Entropy bits display */
+    GtkWidget *musikey_users_tree;         /* Enrolled users list */
+    GtkListStore *musikey_users_store;     /* User data store */
+    void *musikey_system;                  /* MusiKey context */
+    void *musikey_current_song;            /* Current song for playback */
+    guint musikey_anim_timer;              /* Animation timer */
+    float musikey_piano_highlights[25];    /* Piano key highlight values */
+    float musikey_vis_bars[32];            /* Visualizer bar heights */
+    int musikey_playing;                   /* Playback state */
+
     /* Backup utility widgets */
     GtkWidget *backup_panel;
     GtkWidget *backup_tree;
@@ -318,6 +338,7 @@ GtkWidget *phantom_gui_create_desktop_lab_panel(phantom_gui_t *gui);
 GtkWidget *phantom_gui_create_desktop_panel(phantom_gui_t *gui);
 GtkWidget *phantom_gui_create_pods_panel(phantom_gui_t *gui);
 GtkWidget *phantom_gui_create_backup_panel(phantom_gui_t *gui);
+GtkWidget *phantom_gui_create_musikey_panel(phantom_gui_t *gui);
 
 /* Refresh functions */
 void phantom_gui_refresh_files(phantom_gui_t *gui);
@@ -333,6 +354,7 @@ void phantom_gui_refresh_desktop_lab(phantom_gui_t *gui);
 void phantom_gui_refresh_desktop(phantom_gui_t *gui);
 void phantom_gui_refresh_pods(phantom_gui_t *gui);
 void phantom_gui_refresh_backup(phantom_gui_t *gui);
+void phantom_gui_refresh_musikey(phantom_gui_t *gui);
 
 /* File browser actions */
 void phantom_gui_navigate_to(phantom_gui_t *gui, const char *path);
