@@ -61,7 +61,7 @@ GUI_OBJS = $(GUI_SRCS:.c=.o)
 GUI_BIN = phantom-gui
 
 # Shared objects (kernel without main)
-SHARED_OBJS = vfs.o procfs.o devfs.o geofs_vfs.o init.o governor.o phantom_ai.o phantom_ai_builtin.o phantom_net.o phantom_tls.o phantom_user.o phantom_pkg.o phantom_time.o phantom_browser.o phantom_webbrowser.o phantom_apps.o phantom_storage.o phantom_urlscan.o phantom_antimalware.o phantom_pods.o phantom_backup.o phantom_dnauth.o phantom_qrnet.o phantom_qrnet_transport.o phantom_musikey.o $(MEDIAPLAYER_OBJ) $(GEOFS_OBJ)
+SHARED_OBJS = vfs.o procfs.o devfs.o geofs_vfs.o init.o governor.o phantom_ai.o phantom_ai_builtin.o phantom_net.o phantom_tls.o phantom_user.o phantom_pkg.o phantom_time.o phantom_browser.o phantom_webbrowser.o phantom_apps.o phantom_storage.o phantom_urlscan.o phantom_antimalware.o phantom_pods.o phantom_backup.o phantom_dnauth.o phantom_qrnet.o phantom_qrnet_transport.o phantom_musikey.o phantom_biosense.o phantom_lifeauth.o $(MEDIAPLAYER_OBJ) $(GEOFS_OBJ)
 
 # OpenSSL for DNAuth hashing
 OPENSSL_LIBS = -lssl -lcrypto
@@ -151,7 +151,7 @@ phantom_urlscan.o: phantom_urlscan.c phantom_urlscan.h
 phantom_mediaplayer.o: phantom_mediaplayer.c phantom_mediaplayer.h
 	$(CC) $(CFLAGS) $(GSTREAMER_CFLAGS) -c -o $@ $<
 
-gui.o: gui.c gui.h phantom.h vfs.h init.h governor.h phantom_ai.h phantom_net.h phantom_user.h phantom_storage.h phantom_webbrowser.h phantom_urlscan.h phantom_pods.h phantom_dnauth.h phantom_qrnet.h phantom_musikey.h
+gui.o: gui.c gui.h phantom.h vfs.h init.h governor.h phantom_ai.h phantom_net.h phantom_user.h phantom_storage.h phantom_webbrowser.h phantom_urlscan.h phantom_pods.h phantom_dnauth.h phantom_qrnet.h phantom_musikey.h phantom_biosense.h
 	$(CC) $(CFLAGS) $(MEDIAPLAYER_CFLAG) $(GTK_CFLAGS) $(WEBKIT_CFLAGS) $(GSTREAMER_CFLAGS) $(QRENCODE_CFLAGS) -c -o $@ $<
 
 phantom_gui.o: phantom_gui.c gui.h phantom.h vfs.h init.h governor.h phantom_user.h
@@ -170,6 +170,12 @@ phantom_qrnet_transport.o: phantom_qrnet_transport.c phantom_qrnet_transport.h p
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 phantom_musikey.o: phantom_musikey.c phantom_musikey.h
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
+
+phantom_biosense.o: phantom_biosense.c phantom_biosense.h
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
+
+phantom_lifeauth.o: phantom_lifeauth.c phantom_lifeauth.h
 	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
 
 demo: $(KERNEL_BIN)
@@ -221,6 +227,30 @@ test-qrnet-transport: test_qrnet_transport.o phantom_qrnet_transport.o phantom_q
 
 test_qrnet_transport.o: test_qrnet_transport.c phantom_qrnet_transport.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# BioSense test suite (blood/vein biometric authentication)
+test-biosense: test_biosense.o phantom_biosense.o
+	$(CC) $(CFLAGS) -o test_biosense $^ $(OPENSSL_LIBS) -lm
+	./test_biosense
+
+test_biosense.o: test_biosense.c phantom_biosense.h
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
+
+# MusiKey test suite (musical authentication)
+test-musikey: test_musikey.o phantom_musikey.o
+	$(CC) $(CFLAGS) -o test_musikey $^ $(OPENSSL_LIBS) -lm
+	./test_musikey
+
+test_musikey.o: test_musikey.c phantom_musikey.h
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
+
+# LifeAuth test suite (blood plasma authentication)
+test-lifeauth: test_lifeauth.o phantom_lifeauth.o
+	$(CC) $(CFLAGS) -o test_lifeauth $^ $(OPENSSL_LIBS) -lm
+	./test_lifeauth
+
+test_lifeauth.o: test_lifeauth.c phantom_lifeauth.h
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
 
 clean:
 	rm -f $(KERNEL_OBJS) $(GUI_OBJS) $(GEOFS_OBJ) $(KERNEL_BIN) $(GUI_BIN) phantom_nogui.o phantom.geo *.o
