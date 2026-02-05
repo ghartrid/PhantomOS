@@ -252,6 +252,17 @@ test-lifeauth: test_lifeauth.o phantom_lifeauth.o
 test_lifeauth.o: test_lifeauth.c phantom_lifeauth.h
 	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
 
+# LifeAuth GUI test
+test-lifeauth-gui: test_lifeauth_gui.o phantom_lifeauth_gui.o phantom_lifeauth.o
+	$(CC) $(CFLAGS) -o test_lifeauth_gui $^ $(OPENSSL_LIBS) -lm
+	./test_lifeauth_gui
+
+test_lifeauth_gui.o: test_lifeauth_gui.c phantom_lifeauth_gui.h
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
+
+phantom_lifeauth_gui.o: phantom_lifeauth_gui.c phantom_lifeauth_gui.h phantom_lifeauth.h
+	$(CC) $(CFLAGS) -DHAVE_OPENSSL -c -o $@ $<
+
 clean:
 	rm -f $(KERNEL_OBJS) $(GUI_OBJS) $(GEOFS_OBJ) $(KERNEL_BIN) $(GUI_BIN) phantom_nogui.o phantom.geo *.o
 
