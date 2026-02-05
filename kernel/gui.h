@@ -246,6 +246,40 @@ typedef struct phantom_gui {
     float musikey_vis_bars[32];            /* Visualizer bar heights */
     int musikey_playing;                   /* Playback state */
 
+    /* LifeAuth widgets (Blood Plasma Authentication) */
+    GtkWidget *lifeauth_panel;
+    GtkWidget *lifeauth_viz_area;          /* Biomarker visualization */
+    GtkWidget *lifeauth_fingerprint_area;  /* Plasma fingerprint display */
+    GtkWidget *lifeauth_username_entry;    /* Username input */
+    GtkWidget *lifeauth_password_entry;    /* Password input */
+    GtkWidget *lifeauth_enroll_btn;        /* Enroll button */
+    GtkWidget *lifeauth_auth_btn;          /* Authenticate button */
+    GtkWidget *lifeauth_sample_btn;        /* Collect sample button */
+    GtkWidget *lifeauth_status_label;      /* Status display */
+    GtkWidget *lifeauth_match_bar;         /* Similarity progress bar */
+    GtkWidget *lifeauth_health_label;      /* Health alert display */
+    GtkWidget *lifeauth_users_tree;        /* Enrolled users list */
+    GtkListStore *lifeauth_users_store;    /* User data store */
+    void *lifeauth_credential;             /* Current credential */
+    guint lifeauth_anim_timer;             /* Animation timer */
+    float lifeauth_biomarkers[32];         /* Biomarker visualization values */
+
+    /* BioSense widgets (Vein Pattern Authentication) */
+    GtkWidget *biosense_panel;
+    GtkWidget *biosense_scan_area;         /* Vein scan visualization */
+    GtkWidget *biosense_username_entry;    /* Username input */
+    GtkWidget *biosense_password_entry;    /* Password input */
+    GtkWidget *biosense_enroll_btn;        /* Enroll button */
+    GtkWidget *biosense_auth_btn;          /* Authenticate button */
+    GtkWidget *biosense_scan_btn;          /* Start scan button */
+    GtkWidget *biosense_status_label;      /* Status display */
+    GtkWidget *biosense_match_bar;         /* Similarity progress bar */
+    GtkWidget *biosense_liveness_label;    /* Liveness score display */
+    GtkWidget *biosense_users_tree;        /* Enrolled users list */
+    GtkListStore *biosense_users_store;    /* User data store */
+    void *biosense_driver;                 /* BioSense driver handle */
+    guint biosense_anim_timer;             /* Animation timer */
+
     /* Backup utility widgets */
     GtkWidget *backup_panel;
     GtkWidget *backup_tree;

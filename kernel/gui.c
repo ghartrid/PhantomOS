@@ -191,6 +191,25 @@ static const char *phantom_css =
     "    box-shadow: 0 2px 4px rgba(35, 134, 54, 0.3);\n"
     "}\n"
     "\n"
+    "/* Sidebar expanders for grouped menu */\n"
+    ".phantom-sidebar expander {\n"
+    "    background: transparent;\n"
+    "    border: none;\n"
+    "    padding: 0;\n"
+    "}\n"
+    ".phantom-sidebar expander title {\n"
+    "    color: #58a6ff;\n"
+    "    font-weight: bold;\n"
+    "    font-size: 11px;\n"
+    "    padding: 8px 12px 4px 12px;\n"
+    "    letter-spacing: 0.5px;\n"
+    "}\n"
+    ".phantom-sidebar expander arrow {\n"
+    "    color: #58a6ff;\n"
+    "    min-width: 12px;\n"
+    "    min-height: 12px;\n"
+    "}\n"
+    "\n"
     "/* Status bar */\n"
     ".phantom-status {\n"
     "    background-color: #161b22;\n"
@@ -540,6 +559,10 @@ static void on_stack_visible_child_changed(GObject *stack, GParamSpec *pspec, ph
 static gboolean on_refresh_timer(phantom_gui_t *gui);
 static void on_window_destroy(GtkWidget *widget, phantom_gui_t *gui);
 
+/* Panel creation forward declarations */
+GtkWidget *phantom_gui_create_lifeauth_panel(phantom_gui_t *gui);
+GtkWidget *phantom_gui_create_biosense_panel(phantom_gui_t *gui);
+
 /* ══════════════════════════════════════════════════════════════════════════════
  * INITIALIZATION
  * ══════════════════════════════════════════════════════════════════════════════ */
@@ -589,80 +612,105 @@ int phantom_gui_init(phantom_gui_t *gui,
     gui->main_paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(main_box), gui->main_paned, TRUE, TRUE, 0);
 
-    /* Create sidebar */
-    gui->sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_size_request(gui->sidebar, 180, -1);
-    gtk_style_context_add_class(gtk_widget_get_style_context(gui->sidebar), "phantom-sidebar");
-    gtk_paned_pack1(GTK_PANED(gui->main_paned), gui->sidebar, FALSE, FALSE);
+    /* Create sidebar with scrolling */
+    GtkWidget *sidebar_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sidebar_scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(sidebar_scroll, 180, -1);
+    gtk_style_context_add_class(gtk_widget_get_style_context(sidebar_scroll), "phantom-sidebar");
+    gtk_paned_pack1(GTK_PANED(gui->main_paned), sidebar_scroll, FALSE, FALSE);
 
-    /* Sidebar buttons */
-#ifdef HAVE_GSTREAMER
-    const char *sidebar_items[] = {
-        "🏠 Desktop",
-        "📁 Files",
-        "⚙️ Processes",
-        "🔧 Services",
-        "🛡️ Governor",
-        "🪨 Geology",
-        "💻 Terminal",
-        "📜 Constitution",
-        "🤖 AI Assistant",
-        "🌐 Network",
-        "📱 Apps",
-        "🔒 Security",
-        "🎵 Media",
-        "🎨 ArtOS",
-        "👥 Users",
-        "🧬 DNAuth",
-        "🎹 MusiKey",
-        "📡 QRNet",
-        "📦 PhantomPods",
-        "💾 Backup",
-        "🧪 Desktop Lab"
-    };
-    const char *sidebar_names[] = {
-        "desktop", "files", "processes", "services", "governor", "geology", "terminal", "constitution", "ai", "network", "apps", "security", "media", "artos", "users", "dnauth", "musikey", "qrnet", "pods", "backup", "desktoplab"
-    };
-    const int sidebar_count = 21;
-#else
-    const char *sidebar_items[] = {
-        "🏠 Desktop",
-        "📁 Files",
-        "⚙️ Processes",
-        "🔧 Services",
-        "🛡️ Governor",
-        "🪨 Geology",
-        "💻 Terminal",
-        "📜 Constitution",
-        "🤖 AI Assistant",
-        "🌐 Network",
-        "📱 Apps",
-        "🔒 Security",
-        "🎨 ArtOS",
-        "👥 Users",
-        "🧬 DNAuth",
-        "🎹 MusiKey",
-        "📡 QRNet",
-        "📦 PhantomPods",
-        "💾 Backup",
-        "🧪 Desktop Lab"
-    };
-    const char *sidebar_names[] = {
-        "desktop", "files", "processes", "services", "governor", "geology", "terminal", "constitution", "ai", "network", "apps", "security", "artos", "users", "dnauth", "musikey", "qrnet", "pods", "backup", "desktoplab"
-    };
-    const int sidebar_count = 20;
-#endif
+    gui->sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(sidebar_scroll), gui->sidebar);
+
+    /* Helper macro to add sidebar button */
+    #define ADD_SIDEBAR_BTN(box, label, name) do { \
+        GtkWidget *btn = gtk_toggle_button_new_with_label(label); \
+        gtk_widget_set_name(btn, name); \
+        g_object_set_data(G_OBJECT(btn), "panel-name", (gpointer)name); \
+        g_signal_connect(btn, "toggled", G_CALLBACK(on_sidebar_button_clicked), gui); \
+        gtk_box_pack_start(GTK_BOX(box), btn, FALSE, FALSE, 0); \
+        if (!first_button) first_button = btn; \
+    } while(0)
 
     GtkWidget *first_button = NULL;
-    for (int i = 0; i < sidebar_count; i++) {
-        GtkWidget *button = gtk_toggle_button_new_with_label(sidebar_items[i]);
-        gtk_widget_set_name(button, sidebar_names[i]);
-        g_object_set_data(G_OBJECT(button), "panel-name", (gpointer)sidebar_names[i]);
-        g_signal_connect(button, "toggled", G_CALLBACK(on_sidebar_button_clicked), gui);
-        gtk_box_pack_start(GTK_BOX(gui->sidebar), button, FALSE, FALSE, 0);
+    GtkWidget *expander, *exp_box;
 
-        if (i == 0) first_button = button;
-    }
+    /* CORE - Always visible, expanded by default */
+    expander = gtk_expander_new("CORE");
+    gtk_expander_set_expanded(GTK_EXPANDER(expander), TRUE);
+    exp_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(expander), exp_box);
+    gtk_box_pack_start(GTK_BOX(gui->sidebar), expander, FALSE, FALSE, 0);
+    ADD_SIDEBAR_BTN(exp_box, "🏠 Desktop", "desktop");
+    ADD_SIDEBAR_BTN(exp_box, "📁 Files", "files");
+    ADD_SIDEBAR_BTN(exp_box, "💻 Terminal", "terminal");
+
+    /* SYSTEM */
+    expander = gtk_expander_new("SYSTEM");
+    gtk_expander_set_expanded(GTK_EXPANDER(expander), TRUE);
+    exp_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(expander), exp_box);
+    gtk_box_pack_start(GTK_BOX(gui->sidebar), expander, FALSE, FALSE, 0);
+    ADD_SIDEBAR_BTN(exp_box, "⚙️ Processes", "processes");
+    ADD_SIDEBAR_BTN(exp_box, "🔧 Services", "services");
+    ADD_SIDEBAR_BTN(exp_box, "🛡️ Governor", "governor");
+    ADD_SIDEBAR_BTN(exp_box, "🪨 Geology", "geology");
+
+    /* SECURITY */
+    expander = gtk_expander_new("SECURITY");
+    gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
+    exp_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(expander), exp_box);
+    gtk_box_pack_start(GTK_BOX(gui->sidebar), expander, FALSE, FALSE, 0);
+    ADD_SIDEBAR_BTN(exp_box, "🔒 Security", "security");
+    ADD_SIDEBAR_BTN(exp_box, "🧬 DNAuth", "dnauth");
+    ADD_SIDEBAR_BTN(exp_box, "🎹 MusiKey", "musikey");
+    ADD_SIDEBAR_BTN(exp_box, "🩸 LifeAuth", "lifeauth");
+    ADD_SIDEBAR_BTN(exp_box, "🔬 BioSense", "biosense");
+
+    /* NETWORK */
+    expander = gtk_expander_new("NETWORK");
+    gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
+    exp_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(expander), exp_box);
+    gtk_box_pack_start(GTK_BOX(gui->sidebar), expander, FALSE, FALSE, 0);
+    ADD_SIDEBAR_BTN(exp_box, "🌐 Network", "network");
+    ADD_SIDEBAR_BTN(exp_box, "📡 QRNet", "qrnet");
+
+    /* APPS */
+    expander = gtk_expander_new("APPS");
+    gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
+    exp_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(expander), exp_box);
+    gtk_box_pack_start(GTK_BOX(gui->sidebar), expander, FALSE, FALSE, 0);
+    ADD_SIDEBAR_BTN(exp_box, "📱 Apps", "apps");
+#ifdef HAVE_GSTREAMER
+    ADD_SIDEBAR_BTN(exp_box, "🎵 Media", "media");
+#endif
+    ADD_SIDEBAR_BTN(exp_box, "🎨 ArtOS", "artos");
+
+    /* UTILITIES */
+    expander = gtk_expander_new("UTILITIES");
+    gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
+    exp_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(expander), exp_box);
+    gtk_box_pack_start(GTK_BOX(gui->sidebar), expander, FALSE, FALSE, 0);
+    ADD_SIDEBAR_BTN(exp_box, "👥 Users", "users");
+    ADD_SIDEBAR_BTN(exp_box, "📦 PhantomPods", "pods");
+    ADD_SIDEBAR_BTN(exp_box, "💾 Backup", "backup");
+    ADD_SIDEBAR_BTN(exp_box, "🧪 Desktop Lab", "desktoplab");
+
+    /* REFERENCE */
+    expander = gtk_expander_new("REFERENCE");
+    gtk_expander_set_expanded(GTK_EXPANDER(expander), FALSE);
+    exp_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(expander), exp_box);
+    gtk_box_pack_start(GTK_BOX(gui->sidebar), expander, FALSE, FALSE, 0);
+    ADD_SIDEBAR_BTN(exp_box, "📜 Constitution", "constitution");
+    ADD_SIDEBAR_BTN(exp_box, "🤖 AI Assistant", "ai");
+
+    #undef ADD_SIDEBAR_BTN
 
     /* Create content stack */
     gui->content_stack = gtk_stack_new();
@@ -743,6 +791,14 @@ int phantom_gui_init(phantom_gui_t *gui,
     /* MusiKey - Musical Authentication */
     gui->musikey_panel = phantom_gui_create_musikey_panel(gui);
     gtk_stack_add_named(GTK_STACK(gui->content_stack), gui->musikey_panel, "musikey");
+
+    /* LifeAuth - Blood Plasma Authentication */
+    gui->lifeauth_panel = phantom_gui_create_lifeauth_panel(gui);
+    gtk_stack_add_named(GTK_STACK(gui->content_stack), gui->lifeauth_panel, "lifeauth");
+
+    /* BioSense - Vein Pattern Authentication */
+    gui->biosense_panel = phantom_gui_create_biosense_panel(gui);
+    gtk_stack_add_named(GTK_STACK(gui->content_stack), gui->biosense_panel, "biosense");
 
     /* Desktop Lab - Widgets & Experimental Features */
     gui->desktop_lab_panel = phantom_gui_create_desktop_lab_panel(gui);
@@ -11829,4 +11885,545 @@ void phantom_gui_refresh_musikey(phantom_gui_t *gui) {
         gtk_widget_queue_draw(gui->musikey_piano_area);
     if (gui->musikey_visualizer_area)
         gtk_widget_queue_draw(gui->musikey_visualizer_area);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *                         LIFEAUTH PANEL
+ *                  Blood Plasma Biometric Authentication
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Biomarker category colors */
+#define LIFEAUTH_COL_PROTEIN    0.29, 0.62, 1.0    /* Blue */
+#define LIFEAUTH_COL_ANTIBODY   0.29, 0.87, 0.50   /* Green */
+#define LIFEAUTH_COL_METABOLITE 0.98, 0.75, 0.14   /* Amber */
+#define LIFEAUTH_COL_ENZYME     0.96, 0.45, 0.71   /* Pink */
+
+/* Animation tick for LifeAuth */
+static gboolean on_lifeauth_animation_tick(phantom_gui_t *gui) {
+    if (!gui || !gui->lifeauth_viz_area) return FALSE;
+
+    /* Animate biomarker bars with subtle wave */
+    for (int i = 0; i < 32; i++) {
+        float target = 0.3f + 0.4f * ((float)(i * 7 % 10) / 10.0f);
+        gui->lifeauth_biomarkers[i] += (target - gui->lifeauth_biomarkers[i]) * 0.1f;
+    }
+
+    gtk_widget_queue_draw(gui->lifeauth_viz_area);
+    if (gui->lifeauth_fingerprint_area)
+        gtk_widget_queue_draw(gui->lifeauth_fingerprint_area);
+
+    return TRUE;
+}
+
+/* Draw biomarker visualization */
+static gboolean on_lifeauth_viz_draw(GtkWidget *widget, cairo_t *cr, phantom_gui_t *gui) {
+    int width = gtk_widget_get_allocated_width(widget);
+    int height = gtk_widget_get_allocated_height(widget);
+
+    /* Dark background */
+    cairo_set_source_rgb(cr, 0.04, 0.09, 0.16);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    /* Draw biomarker categories */
+    int bar_width = width / 36;
+    int spacing = 2;
+    int section_gap = 10;
+    int x = 10;
+
+    /* Proteins (8 bars) - Blue */
+    cairo_set_source_rgb(cr, LIFEAUTH_COL_PROTEIN);
+    for (int i = 0; i < 8; i++) {
+        int bar_height = (int)(gui->lifeauth_biomarkers[i] * (height - 40));
+        cairo_rectangle(cr, x, height - 20 - bar_height, bar_width - spacing, bar_height);
+        cairo_fill(cr);
+        x += bar_width;
+    }
+    x += section_gap;
+
+    /* Antibodies (6 bars) - Green */
+    cairo_set_source_rgb(cr, LIFEAUTH_COL_ANTIBODY);
+    for (int i = 8; i < 14; i++) {
+        int bar_height = (int)(gui->lifeauth_biomarkers[i] * (height - 40));
+        cairo_rectangle(cr, x, height - 20 - bar_height, bar_width - spacing, bar_height);
+        cairo_fill(cr);
+        x += bar_width;
+    }
+    x += section_gap;
+
+    /* Metabolites (8 bars) - Amber */
+    cairo_set_source_rgb(cr, LIFEAUTH_COL_METABOLITE);
+    for (int i = 14; i < 22; i++) {
+        int bar_height = (int)(gui->lifeauth_biomarkers[i] * (height - 40));
+        cairo_rectangle(cr, x, height - 20 - bar_height, bar_width - spacing, bar_height);
+        cairo_fill(cr);
+        x += bar_width;
+    }
+    x += section_gap;
+
+    /* Enzymes (6 bars) - Pink */
+    cairo_set_source_rgb(cr, LIFEAUTH_COL_ENZYME);
+    for (int i = 22; i < 28; i++) {
+        int bar_height = (int)(gui->lifeauth_biomarkers[i] * (height - 40));
+        cairo_rectangle(cr, x, height - 20 - bar_height, bar_width - spacing, bar_height);
+        cairo_fill(cr);
+        x += bar_width;
+    }
+
+    /* Category labels */
+    cairo_set_source_rgb(cr, 0.6, 0.7, 0.8);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 9);
+
+    cairo_move_to(cr, 10, height - 5);
+    cairo_show_text(cr, "Proteins");
+    cairo_move_to(cr, 10 + 8*bar_width + section_gap, height - 5);
+    cairo_show_text(cr, "Antibodies");
+    cairo_move_to(cr, 10 + 14*bar_width + 2*section_gap, height - 5);
+    cairo_show_text(cr, "Metabolites");
+    cairo_move_to(cr, 10 + 22*bar_width + 3*section_gap, height - 5);
+    cairo_show_text(cr, "Enzymes");
+
+    return FALSE;
+}
+
+/* Draw plasma fingerprint (8x8 grid) */
+static gboolean on_lifeauth_fingerprint_draw(GtkWidget *widget, cairo_t *cr, phantom_gui_t *gui) {
+    int width = gtk_widget_get_allocated_width(widget);
+    int height = gtk_widget_get_allocated_height(widget);
+
+    /* Dark background */
+    cairo_set_source_rgb(cr, 0.04, 0.09, 0.16);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    /* Draw 8x8 plasma fingerprint grid */
+    int cell_size = (width < height ? width : height) / 10;
+    int offset_x = (width - cell_size * 8) / 2;
+    int offset_y = (height - cell_size * 8) / 2;
+
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            int idx = y * 8 + x;
+            float intensity = gui->lifeauth_biomarkers[idx % 32] * 0.8f + 0.2f;
+
+            /* Purple gradient based on intensity */
+            cairo_set_source_rgb(cr, 0.55 * intensity, 0.36 * intensity, 0.96 * intensity);
+            cairo_rectangle(cr, offset_x + x * cell_size + 1, offset_y + y * cell_size + 1,
+                          cell_size - 2, cell_size - 2);
+            cairo_fill(cr);
+        }
+    }
+
+    /* Border */
+    cairo_set_source_rgb(cr, 0.35, 0.23, 0.60);
+    cairo_set_line_width(cr, 2);
+    cairo_rectangle(cr, offset_x - 2, offset_y - 2, cell_size * 8 + 4, cell_size * 8 + 4);
+    cairo_stroke(cr);
+
+    /* Label */
+    cairo_set_source_rgb(cr, 0.7, 0.8, 0.9);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 11);
+    cairo_move_to(cr, offset_x, offset_y - 8);
+    cairo_show_text(cr, "Plasma Fingerprint");
+
+    return FALSE;
+}
+
+/* LifeAuth button handlers */
+static void on_lifeauth_sample_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+    gtk_label_set_markup(GTK_LABEL(gui->lifeauth_status_label),
+        "<span color='#58a6ff'>🩸 Collecting blood plasma sample...</span>");
+
+    /* Simulate sample collection with animation */
+    for (int i = 0; i < 32; i++) {
+        gui->lifeauth_biomarkers[i] = 0.1f;
+    }
+
+    g_timeout_add(100, (GSourceFunc)on_lifeauth_animation_tick, gui);
+}
+
+static void on_lifeauth_enroll_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+    const char *username = gtk_entry_get_text(GTK_ENTRY(gui->lifeauth_username_entry));
+    const char *password = gtk_entry_get_text(GTK_ENTRY(gui->lifeauth_password_entry));
+
+    if (!username || strlen(username) == 0) {
+        gtk_label_set_markup(GTK_LABEL(gui->lifeauth_status_label),
+            "<span color='#f85149'>⚠ Enter username</span>");
+        return;
+    }
+    if (!password || strlen(password) < 8) {
+        gtk_label_set_markup(GTK_LABEL(gui->lifeauth_status_label),
+            "<span color='#f85149'>⚠ Password must be at least 8 characters</span>");
+        return;
+    }
+
+    gtk_label_set_markup(GTK_LABEL(gui->lifeauth_status_label),
+        "<span color='#3fb950'>✓ Plasma profile enrolled successfully</span>");
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(gui->lifeauth_match_bar), 1.0);
+}
+
+static void on_lifeauth_auth_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+    gtk_label_set_markup(GTK_LABEL(gui->lifeauth_status_label),
+        "<span color='#58a6ff'>🔬 Analyzing plasma biomarkers...</span>");
+
+    /* Simulate authentication with match score */
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(gui->lifeauth_match_bar), 0.94);
+
+    g_timeout_add(1500, (GSourceFunc)(void(*)(void))gtk_false, NULL);
+    gtk_label_set_markup(GTK_LABEL(gui->lifeauth_status_label),
+        "<span color='#3fb950'>✓ Identity verified (94% match)</span>");
+}
+
+/* Create LifeAuth panel */
+GtkWidget *phantom_gui_create_lifeauth_panel(phantom_gui_t *gui) {
+    GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(main_box), "phantom-panel");
+
+    /* Header */
+    GtkWidget *header = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(header),
+        "<span size='x-large' weight='bold' color='#f85149'>🩸 LifeAuth</span>\n"
+        "<span color='#8b949e'>Blood Plasma Biometric Authentication</span>");
+    gtk_widget_set_margin_top(header, 16);
+    gtk_widget_set_margin_bottom(header, 16);
+    gtk_box_pack_start(GTK_BOX(main_box), header, FALSE, FALSE, 0);
+
+    /* Main content */
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_widget_set_margin_start(content, 16);
+    gtk_widget_set_margin_end(content, 16);
+    gtk_box_pack_start(GTK_BOX(main_box), content, TRUE, TRUE, 0);
+
+    /* Left: Visualization */
+    GtkWidget *left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_box_pack_start(GTK_BOX(content), left_box, TRUE, TRUE, 0);
+
+    /* Biomarker visualization */
+    GtkWidget *viz_frame = gtk_frame_new("Biomarker Profile");
+    gui->lifeauth_viz_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(gui->lifeauth_viz_area, 400, 150);
+    g_signal_connect(gui->lifeauth_viz_area, "draw", G_CALLBACK(on_lifeauth_viz_draw), gui);
+    gtk_container_add(GTK_CONTAINER(viz_frame), gui->lifeauth_viz_area);
+    gtk_box_pack_start(GTK_BOX(left_box), viz_frame, TRUE, TRUE, 0);
+
+    /* Plasma fingerprint */
+    GtkWidget *fp_frame = gtk_frame_new("Plasma Fingerprint");
+    gui->lifeauth_fingerprint_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(gui->lifeauth_fingerprint_area, 200, 200);
+    g_signal_connect(gui->lifeauth_fingerprint_area, "draw", G_CALLBACK(on_lifeauth_fingerprint_draw), gui);
+    gtk_container_add(GTK_CONTAINER(fp_frame), gui->lifeauth_fingerprint_area);
+    gtk_box_pack_start(GTK_BOX(left_box), fp_frame, TRUE, TRUE, 0);
+
+    /* Right: Controls */
+    GtkWidget *right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_size_request(right_box, 250, -1);
+    gtk_box_pack_start(GTK_BOX(content), right_box, FALSE, FALSE, 0);
+
+    /* Username entry */
+    GtkWidget *user_label = gtk_label_new("Username:");
+    gtk_widget_set_halign(user_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), user_label, FALSE, FALSE, 0);
+    gui->lifeauth_username_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(gui->lifeauth_username_entry), "Enter username");
+    gtk_box_pack_start(GTK_BOX(right_box), gui->lifeauth_username_entry, FALSE, FALSE, 0);
+
+    /* Password entry */
+    GtkWidget *pass_label = gtk_label_new("Password:");
+    gtk_widget_set_halign(pass_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), pass_label, FALSE, FALSE, 0);
+    gui->lifeauth_password_entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(gui->lifeauth_password_entry), FALSE);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(gui->lifeauth_password_entry), "Enter password");
+    gtk_box_pack_start(GTK_BOX(right_box), gui->lifeauth_password_entry, FALSE, FALSE, 0);
+
+    /* Buttons */
+    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(right_box), btn_box, FALSE, FALSE, 8);
+
+    gui->lifeauth_sample_btn = gtk_button_new_with_label("🩸 Sample");
+    g_signal_connect(gui->lifeauth_sample_btn, "clicked", G_CALLBACK(on_lifeauth_sample_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(btn_box), gui->lifeauth_sample_btn, TRUE, TRUE, 0);
+
+    gui->lifeauth_enroll_btn = gtk_button_new_with_label("📝 Enroll");
+    g_signal_connect(gui->lifeauth_enroll_btn, "clicked", G_CALLBACK(on_lifeauth_enroll_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(btn_box), gui->lifeauth_enroll_btn, TRUE, TRUE, 0);
+
+    gui->lifeauth_auth_btn = gtk_button_new_with_label("🔓 Verify");
+    g_signal_connect(gui->lifeauth_auth_btn, "clicked", G_CALLBACK(on_lifeauth_auth_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(btn_box), gui->lifeauth_auth_btn, TRUE, TRUE, 0);
+
+    /* Match progress bar */
+    GtkWidget *match_label = gtk_label_new("Match Score:");
+    gtk_widget_set_halign(match_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), match_label, FALSE, FALSE, 4);
+    gui->lifeauth_match_bar = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(gui->lifeauth_match_bar), TRUE);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(gui->lifeauth_match_bar), 0.0);
+    gtk_box_pack_start(GTK_BOX(right_box), gui->lifeauth_match_bar, FALSE, FALSE, 0);
+
+    /* Status label */
+    gui->lifeauth_status_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(gui->lifeauth_status_label),
+        "<span color='#8b949e'>Ready for plasma sample</span>");
+    gtk_widget_set_halign(gui->lifeauth_status_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), gui->lifeauth_status_label, FALSE, FALSE, 8);
+
+    /* Health alert area */
+    gui->lifeauth_health_label = gtk_label_new(NULL);
+    gtk_widget_set_halign(gui->lifeauth_health_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), gui->lifeauth_health_label, FALSE, FALSE, 0);
+
+    /* Info */
+    GtkWidget *info = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(info),
+        "<span size='small' color='#6e7681'>"
+        "LifeAuth uses 140+ blood plasma biomarkers\n"
+        "for unique biometric identification.\n"
+        "168-bit entropy • AES-256-GCM encrypted</span>");
+    gtk_widget_set_halign(info, GTK_ALIGN_START);
+    gtk_box_pack_end(GTK_BOX(right_box), info, FALSE, FALSE, 8);
+
+    /* Initialize biomarker values */
+    for (int i = 0; i < 32; i++) {
+        gui->lifeauth_biomarkers[i] = 0.3f + 0.4f * ((float)(i * 7 % 10) / 10.0f);
+    }
+
+    /* Start animation timer */
+    gui->lifeauth_anim_timer = g_timeout_add(100, (GSourceFunc)on_lifeauth_animation_tick, gui);
+
+    return main_box;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *                         BIOSENSE PANEL
+ *                   Vein Pattern Biometric Authentication
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Animation tick for BioSense */
+static gboolean on_biosense_animation_tick(phantom_gui_t *gui) {
+    if (!gui || !gui->biosense_scan_area) return FALSE;
+    gtk_widget_queue_draw(gui->biosense_scan_area);
+    return TRUE;
+}
+
+/* Draw vein scan visualization */
+static gboolean on_biosense_scan_draw(GtkWidget *widget, cairo_t *cr, phantom_gui_t *gui) {
+    (void)gui;
+    int width = gtk_widget_get_allocated_width(widget);
+    int height = gtk_widget_get_allocated_height(widget);
+
+    /* Dark background with subtle gradient */
+    cairo_pattern_t *bg = cairo_pattern_create_linear(0, 0, 0, height);
+    cairo_pattern_add_color_stop_rgb(bg, 0.0, 0.02, 0.04, 0.08);
+    cairo_pattern_add_color_stop_rgb(bg, 1.0, 0.04, 0.08, 0.12);
+    cairo_set_source(cr, bg);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+    cairo_pattern_destroy(bg);
+
+    /* Draw simulated vein pattern */
+    cairo_set_source_rgba(cr, 0.8, 0.2, 0.2, 0.7);
+    cairo_set_line_width(cr, 3);
+
+    /* Main veins */
+    int cx = width / 2;
+    int cy = height / 2;
+
+    /* Central vein */
+    cairo_move_to(cr, cx, cy - 80);
+    cairo_curve_to(cr, cx + 10, cy - 40, cx - 10, cy + 40, cx, cy + 80);
+    cairo_stroke(cr);
+
+    /* Branch veins */
+    cairo_set_line_width(cr, 2);
+    cairo_move_to(cr, cx, cy - 20);
+    cairo_curve_to(cr, cx + 30, cy - 10, cx + 50, cy + 20, cx + 70, cy + 10);
+    cairo_stroke(cr);
+
+    cairo_move_to(cr, cx, cy + 10);
+    cairo_curve_to(cr, cx - 25, cy + 25, cx - 45, cy + 50, cx - 60, cy + 40);
+    cairo_stroke(cr);
+
+    /* Smaller branches */
+    cairo_set_line_width(cr, 1.5);
+    cairo_set_source_rgba(cr, 0.7, 0.15, 0.15, 0.6);
+
+    cairo_move_to(cr, cx + 35, cy);
+    cairo_line_to(cr, cx + 50, cy - 15);
+    cairo_stroke(cr);
+
+    cairo_move_to(cr, cx - 30, cy + 30);
+    cairo_line_to(cr, cx - 45, cy + 45);
+    cairo_stroke(cr);
+
+    /* Bifurcation points */
+    cairo_set_source_rgba(cr, 1.0, 0.4, 0.4, 0.9);
+    cairo_arc(cr, cx, cy - 20, 4, 0, 2 * G_PI);
+    cairo_fill(cr);
+    cairo_arc(cr, cx, cy + 10, 4, 0, 2 * G_PI);
+    cairo_fill(cr);
+    cairo_arc(cr, cx + 35, cy, 3, 0, 2 * G_PI);
+    cairo_fill(cr);
+    cairo_arc(cr, cx - 30, cy + 30, 3, 0, 2 * G_PI);
+    cairo_fill(cr);
+
+    /* Scan line animation */
+    static int scan_y = 0;
+    scan_y = (scan_y + 2) % height;
+
+    cairo_set_source_rgba(cr, 0.2, 0.8, 0.4, 0.3);
+    cairo_rectangle(cr, 0, scan_y - 5, width, 10);
+    cairo_fill(cr);
+
+    /* Frame border */
+    cairo_set_source_rgb(cr, 0.2, 0.5, 0.3);
+    cairo_set_line_width(cr, 2);
+    cairo_rectangle(cr, 5, 5, width - 10, height - 10);
+    cairo_stroke(cr);
+
+    return FALSE;
+}
+
+/* BioSense button handlers */
+static void on_biosense_scan_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+    gtk_label_set_markup(GTK_LABEL(gui->biosense_status_label),
+        "<span color='#58a6ff'>🔍 Scanning vein pattern...</span>");
+    gtk_label_set_markup(GTK_LABEL(gui->biosense_liveness_label),
+        "<span color='#3fb950'>Liveness: Active (pulse detected)</span>");
+}
+
+static void on_biosense_enroll_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+    const char *username = gtk_entry_get_text(GTK_ENTRY(gui->biosense_username_entry));
+
+    if (!username || strlen(username) == 0) {
+        gtk_label_set_markup(GTK_LABEL(gui->biosense_status_label),
+            "<span color='#f85149'>⚠ Enter username</span>");
+        return;
+    }
+
+    gtk_label_set_markup(GTK_LABEL(gui->biosense_status_label),
+        "<span color='#3fb950'>✓ Vein pattern enrolled successfully</span>");
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(gui->biosense_match_bar), 1.0);
+}
+
+static void on_biosense_auth_clicked(GtkWidget *button, phantom_gui_t *gui) {
+    (void)button;
+    gtk_label_set_markup(GTK_LABEL(gui->biosense_status_label),
+        "<span color='#3fb950'>✓ Identity verified (97% match)</span>");
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(gui->biosense_match_bar), 0.97);
+}
+
+/* Create BioSense panel */
+GtkWidget *phantom_gui_create_biosense_panel(phantom_gui_t *gui) {
+    GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(main_box), "phantom-panel");
+
+    /* Header */
+    GtkWidget *header = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(header),
+        "<span size='x-large' weight='bold' color='#f85149'>🩸 BioSense</span>\n"
+        "<span color='#8b949e'>Vein Pattern Biometric Authentication</span>");
+    gtk_widget_set_margin_top(header, 16);
+    gtk_widget_set_margin_bottom(header, 16);
+    gtk_box_pack_start(GTK_BOX(main_box), header, FALSE, FALSE, 0);
+
+    /* Main content */
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_widget_set_margin_start(content, 16);
+    gtk_widget_set_margin_end(content, 16);
+    gtk_box_pack_start(GTK_BOX(main_box), content, TRUE, TRUE, 0);
+
+    /* Left: Vein scan visualization */
+    GtkWidget *left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_box_pack_start(GTK_BOX(content), left_box, TRUE, TRUE, 0);
+
+    GtkWidget *scan_frame = gtk_frame_new("Vein Pattern Scanner");
+    gui->biosense_scan_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(gui->biosense_scan_area, 300, 300);
+    g_signal_connect(gui->biosense_scan_area, "draw", G_CALLBACK(on_biosense_scan_draw), gui);
+    gtk_container_add(GTK_CONTAINER(scan_frame), gui->biosense_scan_area);
+    gtk_box_pack_start(GTK_BOX(left_box), scan_frame, TRUE, TRUE, 0);
+
+    /* Right: Controls */
+    GtkWidget *right_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_size_request(right_box, 250, -1);
+    gtk_box_pack_start(GTK_BOX(content), right_box, FALSE, FALSE, 0);
+
+    /* Username entry */
+    GtkWidget *user_label = gtk_label_new("Username:");
+    gtk_widget_set_halign(user_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), user_label, FALSE, FALSE, 0);
+    gui->biosense_username_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(gui->biosense_username_entry), "Enter username");
+    gtk_box_pack_start(GTK_BOX(right_box), gui->biosense_username_entry, FALSE, FALSE, 0);
+
+    /* Password entry */
+    GtkWidget *pass_label = gtk_label_new("Password:");
+    gtk_widget_set_halign(pass_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), pass_label, FALSE, FALSE, 0);
+    gui->biosense_password_entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(gui->biosense_password_entry), FALSE);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(gui->biosense_password_entry), "Enter password");
+    gtk_box_pack_start(GTK_BOX(right_box), gui->biosense_password_entry, FALSE, FALSE, 0);
+
+    /* Buttons */
+    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(right_box), btn_box, FALSE, FALSE, 8);
+
+    gui->biosense_scan_btn = gtk_button_new_with_label("🔍 Scan");
+    g_signal_connect(gui->biosense_scan_btn, "clicked", G_CALLBACK(on_biosense_scan_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(btn_box), gui->biosense_scan_btn, TRUE, TRUE, 0);
+
+    gui->biosense_enroll_btn = gtk_button_new_with_label("📝 Enroll");
+    g_signal_connect(gui->biosense_enroll_btn, "clicked", G_CALLBACK(on_biosense_enroll_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(btn_box), gui->biosense_enroll_btn, TRUE, TRUE, 0);
+
+    gui->biosense_auth_btn = gtk_button_new_with_label("🔓 Verify");
+    g_signal_connect(gui->biosense_auth_btn, "clicked", G_CALLBACK(on_biosense_auth_clicked), gui);
+    gtk_box_pack_start(GTK_BOX(btn_box), gui->biosense_auth_btn, TRUE, TRUE, 0);
+
+    /* Match progress bar */
+    GtkWidget *match_label = gtk_label_new("Match Score:");
+    gtk_widget_set_halign(match_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), match_label, FALSE, FALSE, 4);
+    gui->biosense_match_bar = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(gui->biosense_match_bar), TRUE);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(gui->biosense_match_bar), 0.0);
+    gtk_box_pack_start(GTK_BOX(right_box), gui->biosense_match_bar, FALSE, FALSE, 0);
+
+    /* Status label */
+    gui->biosense_status_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(gui->biosense_status_label),
+        "<span color='#8b949e'>Place finger on scanner</span>");
+    gtk_widget_set_halign(gui->biosense_status_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), gui->biosense_status_label, FALSE, FALSE, 8);
+
+    /* Liveness indicator */
+    gui->biosense_liveness_label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(gui->biosense_liveness_label),
+        "<span color='#6e7681'>Liveness: Waiting...</span>");
+    gtk_widget_set_halign(gui->biosense_liveness_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(right_box), gui->biosense_liveness_label, FALSE, FALSE, 0);
+
+    /* Info */
+    GtkWidget *info = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(info),
+        "<span size='small' color='#6e7681'>"
+        "BioSense uses near-infrared imaging\n"
+        "to map unique vein bifurcation patterns.\n"
+        "Liveness detection prevents spoofing.</span>");
+    gtk_widget_set_halign(info, GTK_ALIGN_START);
+    gtk_box_pack_end(GTK_BOX(right_box), info, FALSE, FALSE, 8);
+
+    /* Start animation timer */
+    gui->biosense_anim_timer = g_timeout_add(50, (GSourceFunc)on_biosense_animation_tick, gui);
+
+    return main_box;
 }
