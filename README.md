@@ -4,7 +4,7 @@
 
 PhantomOS is an **experimental operating system simulation** exploring an alternative computing philosophy where data is never deleted—only preserved in immutable layers, like geological strata.
 
-**Note:** This is a user-space simulation/proof-of-concept written in C, not a bootable operating system kernel.
+**Note:** This is a user-space simulation/proof-of-concept written in C 
 
 ![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-green)
