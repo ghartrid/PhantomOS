@@ -1246,6 +1246,9 @@ phantom_error_t phantom_sched_stats(struct phantom_kernel *kernel,
  * CLI / DEMO
  * ══════════════════════════════════════════════════════════════════════════════ */
 
+/* Only include CLI/demo functions when not building for GUI */
+#ifndef PHANTOM_NO_MAIN
+
 static void demo_good_code(struct phantom_kernel *kernel) {
     printf("\n=== Testing GOOD code (should be approved) ===\n\n");
 
@@ -1628,9 +1631,6 @@ static void run_shell(struct phantom_kernel *kernel) {
     kernel->governor = NULL;
     vfs_shutdown(&vfs);
 }
-
-/* Only include CLI main when not building for GUI */
-#ifndef PHANTOM_NO_MAIN
 
 static void usage(void) {
     printf("\n");

@@ -46,3 +46,11 @@ packaging/appimage/*.AppImage
 # Backup files
 *.bak
 *.orig
+
+# Kernel build artifacts
+*.elf
+*.iso
+*.tar.gz
+kernel/test_biosense
+kernel/test_lifeauth
+kernel/test_musikey

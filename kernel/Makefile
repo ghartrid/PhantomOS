@@ -61,7 +61,7 @@ GUI_OBJS = $(GUI_SRCS:.c=.o)
 GUI_BIN = phantom-gui
 
 # Shared objects (kernel without main)
-SHARED_OBJS = vfs.o procfs.o devfs.o geofs_vfs.o init.o governor.o phantom_ai.o phantom_ai_builtin.o phantom_net.o phantom_tls.o phantom_user.o phantom_pkg.o phantom_time.o phantom_browser.o phantom_webbrowser.o phantom_apps.o phantom_storage.o phantom_urlscan.o phantom_antimalware.o phantom_pods.o phantom_backup.o phantom_dnauth.o phantom_qrnet.o phantom_qrnet_transport.o phantom_musikey.o phantom_biosense.o phantom_lifeauth.o $(MEDIAPLAYER_OBJ) $(GEOFS_OBJ)
+SHARED_OBJS = vfs.o procfs.o devfs.o geofs_vfs.o init.o governor_sim.o phantom_ai.o phantom_ai_builtin.o phantom_net.o phantom_tls.o phantom_user.o phantom_pkg.o phantom_time.o phantom_browser.o phantom_webbrowser.o phantom_apps.o phantom_storage.o phantom_urlscan.o phantom_antimalware.o phantom_pods.o phantom_backup.o phantom_dnauth.o phantom_qrnet.o phantom_qrnet_transport.o phantom_musikey.o phantom_biosense.o phantom_lifeauth.o $(MEDIAPLAYER_OBJ) $(GEOFS_OBJ)
 
 # OpenSSL for DNAuth hashing
 OPENSSL_LIBS = -lssl -lcrypto
@@ -110,6 +110,9 @@ init.o: init.c init.h vfs.h phantom.h ../geofs.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 governor.o: governor.c governor.h phantom.h ../geofs.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+governor_sim.o: governor_sim.c governor.h phantom.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 phantom_ai.o: phantom_ai.c phantom_ai.h phantom_ai_builtin.h phantom.h governor.h

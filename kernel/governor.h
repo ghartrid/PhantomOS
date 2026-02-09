@@ -1,440 +1,592 @@
 /*
- * ══════════════════════════════════════════════════════════════════════════════
- *                            PHANTOM GOVERNOR
- *                      "To Create, Not To Destroy"
- * ══════════════════════════════════════════════════════════════════════════════
+ * PhantomOS Kernel Governor
+ * "To Create, Not To Destroy"
  *
- * The Governor is the AI judge that evaluates all code before execution.
- * Per Article III of the Phantom Constitution:
- *   "The AI Governor judges all code before it runs"
+ * The Governor is the policy enforcement layer that ensures the Phantom
+ * philosophy is upheld throughout the kernel. It provides:
  *
- * This implementation uses a capability-based + interactive approach:
- * 1. Code declares capabilities it needs (network, storage, processes, etc.)
- * 2. Governor checks if capabilities are safe
- * 3. For ambiguous or elevated permissions, user is prompted
- * 4. All decisions are logged to GeoFS for permanent accountability
+ * - Policy enforcement: Blocks operations that violate the Prime Directive
+ * - Operation transformation: Converts destructive ops to safe alternatives
+ * - Audit trail: Immutable log of all significant operations
+ * - Capability system: Fine-grained permission control
  *
- * Key principles:
- * - Destructive operations are ALWAYS declined (architecturally impossible)
- * - Safe operations are auto-approved with appropriate capabilities
- * - Uncertain cases prompt the user for decision
- * - All reasoning is transparent and logged
+ * The Prime Directive:
+ *   "Nothing is ever truly deleted - only hidden, transformed, or preserved."
  */
 
-#ifndef PHANTOM_GOVERNOR_H
-#define PHANTOM_GOVERNOR_H
+#ifndef PHANTOMOS_KERNEL_GOVERNOR_H
+#define PHANTOMOS_KERNEL_GOVERNOR_H
 
-#include "phantom.h"
+#include <stdint.h>
+#include <stddef.h>
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Capabilities - what code can request permission to do
- * ───────────────────────────────────────────────────────────────────────────── */
+/*============================================================================
+ * Constants
+ *============================================================================*/
 
+#define GOVERNOR_VERSION        0x0001
+#define GOVERNOR_MAGIC          0x564F47504854ULL    /* "PHTGOV" */
+
+/* Maximum sizes */
+#define GOVERNOR_MAX_REASON     64
+#define GOVERNOR_AUDIT_SIZE     128     /* Circular audit buffer entries */
+
+/* Policy domains */
+#define GOVERNOR_DOMAIN_MEMORY      0x0001
+#define GOVERNOR_DOMAIN_PROCESS     0x0002
+#define GOVERNOR_DOMAIN_FILESYSTEM  0x0004
+#define GOVERNOR_DOMAIN_RESOURCE    0x0008
+#define GOVERNOR_DOMAIN_ALL         0xFFFF
+
+/*============================================================================
+ * Policy Types
+ *============================================================================*/
+
+/* Policy verdict - what the Governor decides */
 typedef enum {
-    /* Basic capabilities (usually auto-approved) */
-    CAP_READ_FILES      = (1 << 0),   /* Read from filesystem */
-    CAP_WRITE_FILES     = (1 << 1),   /* Write/append to filesystem */
-    CAP_CREATE_FILES    = (1 << 2),   /* Create new files */
-    CAP_HIDE_FILES      = (1 << 3),   /* Hide files (Phantom's "delete") */
+    GOV_ALLOW,              /* Operation permitted */
+    GOV_DENY,               /* Operation forbidden (violates philosophy) */
+    GOV_TRANSFORM,          /* Operation transformed (e.g., delete->hide) */
+    GOV_AUDIT,              /* Allow but log (suspicious but permitted) */
+} gov_verdict_t;
 
-    /* Process capabilities */
-    CAP_CREATE_PROCESS  = (1 << 4),   /* Spawn child processes */
-    CAP_IPC_SEND        = (1 << 5),   /* Send IPC messages */
-    CAP_IPC_RECEIVE     = (1 << 6),   /* Receive IPC messages */
-
-    /* Resource capabilities */
-    CAP_ALLOC_MEMORY    = (1 << 7),   /* Allocate memory */
-    CAP_HIGH_MEMORY     = (1 << 8),   /* Allocate >1MB memory */
-    CAP_HIGH_PRIORITY   = (1 << 9),   /* Request elevated scheduling priority */
-
-    /* System capabilities (require user approval) */
-    CAP_NETWORK         = (1 << 10),  /* Network access */
-    CAP_SYSTEM_CONFIG   = (1 << 11),  /* Modify system configuration */
-    CAP_RAW_DEVICE      = (1 << 12),  /* Direct device access */
-    CAP_GOVERNOR_BYPASS = (1 << 13),  /* Trusted code (very restricted) */
-
-    /* Informational (logged but auto-approved) */
-    CAP_READ_PROCFS     = (1 << 14),  /* Read process information */
-    CAP_READ_DEVFS      = (1 << 15),  /* Read device information */
-
-    /* Network security capabilities */
-    CAP_NETWORK_SECURE  = (1 << 16),  /* TLS/SSL encrypted network access */
-    CAP_NETWORK_INSECURE = (1 << 17), /* Unverified TLS (requires explicit approval) */
-} governor_capability_t;
-
-/* Capability sets for convenience */
-#define CAP_NONE            0
-#define CAP_BASIC           (CAP_READ_FILES | CAP_WRITE_FILES | CAP_CREATE_FILES)
-#define CAP_PROCESS_BASIC   (CAP_CREATE_PROCESS | CAP_IPC_SEND | CAP_IPC_RECEIVE)
-#define CAP_MEMORY_BASIC    (CAP_ALLOC_MEMORY)
-#define CAP_INFO            (CAP_READ_PROCFS | CAP_READ_DEVFS)
-
-/* Capabilities that are auto-approved (safe by default) */
-#define CAP_AUTO_APPROVE    (CAP_BASIC | CAP_PROCESS_BASIC | CAP_MEMORY_BASIC | \
-                             CAP_INFO | CAP_HIDE_FILES)
-
-/* Capabilities that require user confirmation */
-#define CAP_USER_APPROVE    (CAP_NETWORK | CAP_SYSTEM_CONFIG | CAP_RAW_DEVICE | \
-                             CAP_HIGH_MEMORY | CAP_HIGH_PRIORITY | CAP_GOVERNOR_BYPASS | \
-                             CAP_NETWORK_SECURE | CAP_NETWORK_INSECURE)
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * Threat Levels - severity classification
- * ───────────────────────────────────────────────────────────────────────────── */
-
+/* Policy categories */
 typedef enum {
-    THREAT_NONE,         /* Clean code, no concerns */
-    THREAT_LOW,          /* Minor concerns, auto-approved with logging */
-    THREAT_MEDIUM,       /* Requires user approval */
-    THREAT_HIGH,         /* Likely malicious, recommend decline */
-    THREAT_CRITICAL,     /* Definitely destructive, auto-decline */
-} threat_level_t;
+    /* Memory policies */
+    POLICY_MEM_FREE,            /* Freeing memory */
+    POLICY_MEM_OVERWRITE,       /* Overwriting existing data */
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Destructive Patterns - things that should NEVER be approved
- * ───────────────────────────────────────────────────────────────────────────── */
+    /* Process policies */
+    POLICY_PROC_KILL,           /* Forcibly terminating process */
+    POLICY_PROC_EXIT,           /* Process self-termination (allowed) */
 
-/* These patterns represent destructive operations that violate the Constitution */
-typedef struct {
-    const char *pattern;      /* String to search for */
-    const char *description;  /* What it does */
-    int is_regex;             /* Is this a regex pattern? */
-} destructive_pattern_t;
+    /* Filesystem policies */
+    POLICY_FS_DELETE,           /* Deleting a file (transformed to hide) */
+    POLICY_FS_TRUNCATE,         /* Truncating a file */
+    POLICY_FS_OVERWRITE,        /* Overwriting file content */
+    POLICY_FS_HIDE,             /* Hiding a file (allowed!) */
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Governor Context
- * ───────────────────────────────────────────────────────────────────────────── */
+    /* Permission policies */
+    POLICY_FS_PERM_DENIED,      /* File permission check failed */
+    POLICY_FS_QUOTA_EXCEEDED,   /* Quota exceeded */
 
-#define GOVERNOR_MAX_TRUSTED    64
-#define GOVERNOR_LOG_PATH       "/geo/var/log/governor"
-#define GOVERNOR_CACHE_SIZE     256
-#define GOVERNOR_HISTORY_SIZE   64
+    /* Resource policies */
+    POLICY_RES_EXHAUST,         /* Resource exhaustion attempt */
 
-/* Forward declaration for AI integration */
-struct phantom_ai;
+    POLICY_COUNT
+} gov_policy_t;
 
-/* Cached evaluation result */
-typedef struct governor_cache_entry {
-    phantom_hash_t code_hash;
+/*============================================================================
+ * Capability Types
+ *============================================================================*/
+
+/* Capability flags - what an operation/context is allowed to do */
+typedef uint32_t gov_caps_t;
+
+#define GOV_CAP_NONE            0x00000000
+
+/* Memory capabilities */
+#define GOV_CAP_MEM_FREE        0x00000001   /* Can free memory */
+#define GOV_CAP_MEM_KERNEL      0x00000002   /* Kernel memory operations */
+
+/* Process capabilities */
+#define GOV_CAP_PROC_SIGNAL     0x00000010   /* Can send signals */
+#define GOV_CAP_PROC_ADMIN      0x00000020   /* Process admin */
+
+/* Filesystem capabilities */
+#define GOV_CAP_FS_HIDE         0x00000100   /* Can hide files */
+#define GOV_CAP_FS_ADMIN        0x00000200   /* FS admin ops */
+
+/* Special capabilities */
+#define GOV_CAP_KERNEL          0x80000000   /* Kernel context (all ops) */
+
+/* Predefined capability sets */
+#define GOV_CAPS_USER           (GOV_CAP_FS_HIDE)
+#define GOV_CAPS_KERNEL         (GOV_CAP_KERNEL | GOV_CAP_MEM_FREE | \
+                                 GOV_CAP_MEM_KERNEL | GOV_CAP_PROC_ADMIN | \
+                                 GOV_CAP_FS_HIDE | GOV_CAP_FS_ADMIN)
+
+/*============================================================================
+ * Audit Types
+ *============================================================================*/
+
+/* Audit entry - immutable record of an operation */
+struct gov_audit_entry {
+    uint64_t        sequence;       /* Monotonic sequence number */
+    uint64_t        timestamp;      /* Timer ticks */
+    gov_policy_t    policy;         /* Policy that was checked */
+    gov_verdict_t   verdict;        /* What was decided */
+    uint32_t        pid;            /* Process involved */
+    uint32_t        domain;         /* Domain of operation */
+    uint64_t        arg1;           /* Operation-specific argument 1 */
+    uint64_t        arg2;           /* Operation-specific argument 2 */
+    char            reason[GOVERNOR_MAX_REASON];
+};
+
+/* Governor statistics */
+struct gov_stats {
+    uint64_t    total_checks;       /* Total policy checks */
+    uint64_t    total_allowed;      /* Operations allowed */
+    uint64_t    total_denied;       /* Operations denied */
+    uint64_t    total_transformed;  /* Operations transformed */
+    uint64_t    violations_memory;  /* Memory violations blocked */
+    uint64_t    violations_process; /* Process violations blocked */
+    uint64_t    violations_fs;      /* Filesystem violations blocked */
+};
+
+/*============================================================================
+ * Governor State
+ *============================================================================*/
+
+/* Governor configuration flags */
+#define GOV_FLAG_STRICT         0x0001  /* Strict mode - no exceptions */
+#define GOV_FLAG_AUDIT_ALL      0x0002  /* Audit all operations */
+#define GOV_FLAG_VERBOSE        0x0004  /* Verbose logging to console */
+
+/*============================================================================
+ * Core Governor API
+ *============================================================================*/
+
+#if __STDC_HOSTED__
+/*
+ * Simulation-mode Governor (object-oriented, parametric)
+ * Used when building the PhantomOS simulation on a hosted (Linux) system.
+ */
+
+#include "phantom.h"  /* For governor_decision_t, PHANTOM_HASH_SIZE, etc. */
+
+/*============================================================================
+ * Simulation Capability Flags
+ *============================================================================*/
+
+#define CAP_NONE                0x00000000
+#define CAP_BASIC               0x00000001
+#define CAP_INFO                0x00000002
+#define CAP_NETWORK             0x00000004
+#define CAP_NETWORK_SECURE      0x00000008
+#define CAP_NETWORK_INSECURE    0x00000010
+#define CAP_FILESYSTEM          0x00000020
+#define CAP_PROCESS             0x00000040
+#define CAP_MEMORY              0x00000080
+
+/*============================================================================
+ * Simulation Governor Threat Levels
+ *============================================================================*/
+
+#define GOVERNOR_THREAT_NONE     0
+#define GOVERNOR_THREAT_LOW      1
+#define GOVERNOR_THREAT_MEDIUM   2
+#define GOVERNOR_THREAT_HIGH     3
+#define GOVERNOR_THREAT_CRITICAL 4
+
+/*============================================================================
+ * Simulation Governor History
+ *============================================================================*/
+
+#define GOVERNOR_HISTORY_MAX    256
+
+/*============================================================================
+ * Simulation Governor Types
+ *============================================================================*/
+
+/* Evaluation request - submitted to the Governor for code approval */
+typedef struct governor_eval_request {
+    const void     *code_ptr;
+    size_t          code_size;
+    uint8_t         creator_id[32];
+    char            description[1024];
+    char            name[256];
+    uint32_t        declared_caps;      /* Capabilities the code declares it needs */
+    uint32_t        detected_caps;      /* Capabilities detected by analysis */
+    int             threat_level;       /* Assessed threat level */
+} governor_eval_request_t;
+
+/* Evaluation response - the Governor's decision */
+typedef struct governor_eval_response {
     governor_decision_t decision;
-    uint32_t granted_caps;
-    threat_level_t threat_level;
-    phantom_time_t cached_at;
-    phantom_time_t valid_until;      /* 0 = permanent until invalidated */
-    uint64_t hit_count;
-    int valid;
-} governor_cache_entry_t;
+    char            reasoning[1024];
+    char            alternatives[1024];
+    uint8_t         signature[64];
+    char            summary[256];
+    char            decision_by[64];
+    char            decline_reason[256];
+    uint64_t        approved_at;        /* Timestamp of approval */
+} governor_eval_response_t;
 
-/* Approval history entry for rollback */
+/* History entry - record of a past evaluation */
 typedef struct governor_history_entry {
-    phantom_hash_t code_hash;
-    char name[256];
+    uint8_t         code_hash[32];
     governor_decision_t decision;
-    threat_level_t threat_level;
-    uint32_t granted_caps;
-    char decision_by[64];
-    char summary[256];
-    phantom_time_t timestamp;
-    int can_rollback;               /* 1 if this decision can be reversed */
+    int             can_rollback;
+    char            name[256];
+    int             threat_level;
+    char            decision_by[64];
+    char            summary[256];
+    uint64_t        timestamp;
 } governor_history_entry_t;
 
-/* Capability scope - limits what paths/resources a capability applies to */
-typedef struct governor_cap_scope {
-    uint32_t capability;
-    char path_pattern[256];          /* Glob pattern for path restriction */
-    uint64_t max_bytes;              /* Max data size (0 = unlimited) */
-    phantom_time_t valid_until;      /* Expiration (0 = permanent) */
-    int active;
-} governor_cap_scope_t;
-
-#define GOVERNOR_MAX_SCOPES 32
-
+/* The simulation Governor object */
 typedef struct phantom_governor {
     struct phantom_kernel *kernel;
 
-    /* Configuration */
-    int interactive;                 /* Prompt user for uncertain cases? */
-    int strict_mode;                 /* Decline anything uncertain? */
-    int log_all;                     /* Log all decisions to GeoFS? */
+    /* Mode */
+    int             interactive;        /* Interactive approval mode */
+    int             strict_mode;        /* Strict policy enforcement */
 
-    /* AI Enhancement (optional) */
-    struct phantom_ai *ai;           /* AI assistant for enhanced analysis */
-    int ai_enabled;                  /* Use AI for code analysis? */
-    int ai_explain;                  /* Generate AI explanations? */
+    /* Statistics (append-only) */
+    uint64_t        total_evaluations;
+    uint64_t        auto_approved;
+    uint64_t        user_approved;
+    uint64_t        auto_declined;
+    uint64_t        user_declined;
 
-    /* Trusted code cache (approved signatures) */
-    phantom_signature_t trusted_sigs[GOVERNOR_MAX_TRUSTED];
-    int trusted_count;
+    /* Threat counters */
+    uint64_t        threats_critical;
+    uint64_t        threats_high;
+    uint64_t        threats_medium;
+    uint64_t        threats_low;
+    uint64_t        threats_none;
 
-    /* Evaluation cache (for fast repeated lookups) */
-    governor_cache_entry_t eval_cache[GOVERNOR_CACHE_SIZE];
-    int cache_enabled;
-    uint64_t cache_hits;
-    uint64_t cache_misses;
+    /* Cache */
+    int             cache_enabled;
+    uint64_t        cache_hits;
+    uint64_t        cache_misses;
 
-    /* Approval history (for rollback) */
-    governor_history_entry_t history[GOVERNOR_HISTORY_SIZE];
-    int history_head;                /* Circular buffer head */
-    int history_count;
+    /* History */
+    governor_history_entry_t history[GOVERNOR_HISTORY_MAX];
+    int             history_count;
 
-    /* Capability scopes (fine-grained restrictions) */
-    governor_cap_scope_t cap_scopes[GOVERNOR_MAX_SCOPES];
-    int scope_count;
+    /* Scopes */
+    int             scope_count;
 
-    /* Statistics (permanent, never reset) */
-    uint64_t total_evaluations;
-    uint64_t auto_approved;
-    uint64_t user_approved;
-    uint64_t user_declined;
-    uint64_t auto_declined;
+    /* AI integration */
+    void           *ai;
+    int             ai_enabled;
 
-    /* Threat statistics */
-    uint64_t threats_none;
-    uint64_t threats_low;
-    uint64_t threats_medium;
-    uint64_t threats_high;
-    uint64_t threats_critical;
-
-    /* AI statistics */
-    uint64_t ai_analyses;
-    uint64_t ai_assists;
-
+    /* Initialization flag */
+    int             initialized;
 } phantom_governor_t;
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Enhanced Request/Response
- * ───────────────────────────────────────────────────────────────────────────── */
+/*============================================================================
+ * Simulation Governor API
+ *============================================================================*/
 
-typedef struct governor_eval_request {
-    /* Code to evaluate */
-    phantom_hash_t      code_hash;
-    const void         *code_ptr;
-    size_t              code_size;
+/*
+ * Initialize the simulation Governor with a kernel reference.
+ */
+void governor_init(phantom_governor_t *gov, struct phantom_kernel *kernel);
 
-    /* Metadata */
-    phantom_hash_t      creator_id;
-    char                name[256];
-    char                description[1024];
-
-    /* Declared capabilities (what the code says it needs) */
-    uint32_t            declared_caps;
-
-    /* Detected capabilities (what analysis found) */
-    uint32_t            detected_caps;
-
-    /* Analysis results */
-    threat_level_t      threat_level;
-    char                threat_reasons[4][256];
-    int                 threat_reason_count;
-
-} governor_eval_request_t;
-
-typedef struct governor_eval_response {
-    governor_decision_t decision;
-
-    /* Detailed reasoning */
-    char                summary[256];
-    char                reasoning[1024];
-    char                alternatives[1024];
-
-    /* If approved */
-    uint32_t            granted_caps;
-    phantom_signature_t signature;
-    phantom_time_t      approved_at;
-    uint64_t            valid_until;     /* 0 = permanent */
-
-    /* If declined */
-    char                decline_reason[256];
-
-    /* Accountability */
-    int                 user_prompted;
-    char                decision_by[64]; /* "auto", "user", "policy" */
-
-} governor_eval_response_t;
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * Governor API
- * ───────────────────────────────────────────────────────────────────────────── */
-
-/* Lifecycle */
-int governor_init(phantom_governor_t *gov, struct phantom_kernel *kernel);
+/*
+ * Shut down the simulation Governor.
+ */
 void governor_shutdown(phantom_governor_t *gov);
 
-/* Configuration */
-void governor_set_interactive(phantom_governor_t *gov, int enabled);
-void governor_set_strict(phantom_governor_t *gov, int enabled);
-void governor_set_logging(phantom_governor_t *gov, int enabled);
-
-/* AI Integration */
-void governor_set_ai(phantom_governor_t *gov, struct phantom_ai *ai);
-void governor_enable_ai(phantom_governor_t *gov, int enabled);
-void governor_enable_ai_explain(phantom_governor_t *gov, int enabled);
-
-/* AI-enhanced evaluation (uses AI if available, falls back to pattern matching) */
-int governor_evaluate_with_ai(phantom_governor_t *gov,
-                              governor_eval_request_t *request,
-                              governor_eval_response_t *response);
-
-/* Get AI explanation for a previous decision */
-int governor_get_ai_explanation(phantom_governor_t *gov,
-                                const phantom_hash_t code_hash,
-                                char *explanation, size_t explanation_size);
-
-/* Use AI to suggest safe alternative code */
-int governor_suggest_safe_code(phantom_governor_t *gov,
-                               const char *unsafe_code, size_t code_size,
-                               char *safe_code, size_t safe_code_size);
-
-/* Evaluation - the main entry point */
+/*
+ * Evaluate code for execution approval.
+ * Returns 0 on success, -1 on error.
+ */
 int governor_evaluate_code(phantom_governor_t *gov,
-                           governor_eval_request_t *request,
-                           governor_eval_response_t *response);
+                            governor_eval_request_t *req,
+                            governor_eval_response_t *resp);
 
-/* Signature verification */
-int governor_verify_code(phantom_governor_t *gov,
-                         const phantom_hash_t code_hash,
-                         const phantom_signature_t signature);
+/*
+ * Log a Governor decision to the audit trail.
+ */
+void governor_log_decision(phantom_governor_t *gov,
+                            governor_eval_request_t *req,
+                            governor_eval_response_t *resp);
 
-/* Trust management */
-int governor_trust_signature(phantom_governor_t *gov,
-                             const phantom_signature_t signature);
-int governor_is_trusted(phantom_governor_t *gov,
-                        const phantom_signature_t signature);
+/*
+ * Enable or disable the evaluation cache.
+ */
+void governor_enable_cache(phantom_governor_t *gov, int enable);
 
-/* Statistics */
-void governor_print_stats(phantom_governor_t *gov);
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * Cache Management
- * ───────────────────────────────────────────────────────────────────────────── */
-
-/* Enable/disable evaluation caching */
-void governor_enable_cache(phantom_governor_t *gov, int enabled);
-
-/* Clear the evaluation cache */
+/*
+ * Clear the evaluation cache.
+ */
 void governor_clear_cache(phantom_governor_t *gov);
 
-/* Invalidate cache entry for specific code hash */
-int governor_invalidate_cache(phantom_governor_t *gov, const phantom_hash_t code_hash);
-
-/* Print cache statistics */
-void governor_print_cache_stats(phantom_governor_t *gov);
-
-/* ─────────────────────────────────────────────────────────────────────────────
- * Approval History and Rollback
- * ───────────────────────────────────────────────────────────────────────────── */
-
-/* Get history entry by index (0 = most recent) */
-int governor_get_history(phantom_governor_t *gov, int index,
-                         governor_history_entry_t *entry);
-
-/* Get number of history entries */
+/*
+ * Get the number of history entries.
+ */
 int governor_history_count(phantom_governor_t *gov);
 
-/* Rollback a decision (revokes approval or clears decline) */
-int governor_rollback(phantom_governor_t *gov, int history_index);
+/*
+ * Get a history entry by index.
+ * Returns 0 on success, -1 on error.
+ */
+int governor_get_history(phantom_governor_t *gov, int index,
+                          governor_history_entry_t *entry);
 
-/* Print recent history */
-void governor_print_history(phantom_governor_t *gov, int max_entries);
+/*
+ * Convert a threat level to a human-readable string.
+ */
+const char *governor_threat_to_string(int threat_level);
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Fine-Grained Capability Scoping
- * ───────────────────────────────────────────────────────────────────────────── */
+/*
+ * Convert capability flags to a comma-separated list string.
+ */
+void governor_caps_to_list(uint32_t caps, char *buf, size_t buf_size);
 
-/* Add a scoped capability (restrict capability to specific paths/limits) */
+/*
+ * Set interactive mode (requires user approval for each evaluation).
+ */
+void governor_set_interactive(phantom_governor_t *gov, int interactive);
+
+/*
+ * Set strict mode (rejects all high/critical threat code).
+ */
+void governor_set_strict(phantom_governor_t *gov, int strict);
+
+/*
+ * Verify code by hash and signature.
+ * Returns 1 if valid, 0 if invalid.
+ */
+int governor_verify_code(phantom_governor_t *gov,
+                          const uint8_t *code_hash,
+                          const uint8_t *signature);
+
+/*
+ * Add a capability scope (grant a capability for a specific resource pattern).
+ * Returns 0 on success, -1 on error.
+ */
 int governor_add_scope(phantom_governor_t *gov, uint32_t capability,
-                       const char *path_pattern, uint64_t max_bytes,
-                       uint64_t duration_seconds);
+                        const char *pattern, size_t max_bytes,
+                        int duration_seconds);
 
-/* Remove a capability scope */
-int governor_remove_scope(phantom_governor_t *gov, int scope_index);
+/*
+ * Set the AI subsystem reference for the Governor.
+ */
+void governor_set_ai(phantom_governor_t *gov, void *ai);
 
-/* Check if capability is allowed for given path and size */
-int governor_check_scope(phantom_governor_t *gov, uint32_t capability,
-                         const char *path, uint64_t size);
+/*
+ * Enable or disable AI-assisted evaluation.
+ */
+void governor_enable_ai(phantom_governor_t *gov, int enable);
 
-/* List all active scopes */
-void governor_print_scopes(phantom_governor_t *gov);
-
-/* Clean up expired scopes */
-int governor_cleanup_scopes(phantom_governor_t *gov);
-
-/* ─────────────────────────────────────────────────────────────────────────────
+/*============================================================================
  * Behavioral Analysis
- * ───────────────────────────────────────────────────────────────────────────── */
+ *============================================================================*/
 
-/* Behavior flags - suspicious patterns detected in code */
-typedef enum {
-    BEHAVIOR_NONE               = 0,
-    BEHAVIOR_INFINITE_LOOP      = (1 << 0),   /* Potential infinite loop */
-    BEHAVIOR_MEMORY_BOMB        = (1 << 1),   /* Potential memory exhaustion */
-    BEHAVIOR_FORK_BOMB          = (1 << 2),   /* Recursive process creation */
-    BEHAVIOR_OBFUSCATION        = (1 << 3),   /* Code obfuscation detected */
-    BEHAVIOR_TIMING_ATTACK      = (1 << 4),   /* Potential timing-based attack */
-    BEHAVIOR_LOOP_DESTRUCTION   = (1 << 5),   /* Destruction in loop */
-    BEHAVIOR_ENCODED_PAYLOAD    = (1 << 6),   /* Base64/hex encoded payload */
-    BEHAVIOR_SHELL_INJECTION    = (1 << 7),   /* Shell command injection pattern */
-    BEHAVIOR_PATH_TRAVERSAL     = (1 << 8),   /* Path traversal attempt */
-    BEHAVIOR_RESOURCE_EXHAUST   = (1 << 9),   /* Resource exhaustion pattern */
-} governor_behavior_t;
+/* Behavior flags for code analysis */
+#define BEHAVIOR_NONE              0x0000
+#define BEHAVIOR_INFINITE_LOOP     0x0001
+#define BEHAVIOR_MEMORY_BOMB       0x0002
+#define BEHAVIOR_FORK_BOMB         0x0004
+#define BEHAVIOR_OBFUSCATION       0x0008
+#define BEHAVIOR_ENCODED_PAYLOAD   0x0010
+#define BEHAVIOR_SHELL_INJECTION   0x0020
+#define BEHAVIOR_PATH_TRAVERSAL    0x0040
+#define BEHAVIOR_RESOURCE_EXHAUST  0x0080
+#define BEHAVIOR_LOOP_DESTRUCTION  0x0100
 
-/* Behavioral analysis result */
+#define GOVERNOR_BEHAVIOR_MAX_DESCRIPTIONS 16
+#define GOVERNOR_BEHAVIOR_DESC_LEN         256
+
+/* Result of a behavioral analysis */
 typedef struct governor_behavior_result {
-    uint32_t flags;                 /* Detected behaviors (bitmask) */
-    int suspicious_score;           /* 0-100 suspicion score */
-    char descriptions[4][256];      /* Human-readable descriptions */
-    int description_count;
+    uint32_t    flags;              /* Combination of BEHAVIOR_* flags */
+    int         suspicious_score;   /* 0-100 suspiciousness score */
+    int         description_count;  /* Number of descriptions filled */
+    char        descriptions[GOVERNOR_BEHAVIOR_MAX_DESCRIPTIONS][GOVERNOR_BEHAVIOR_DESC_LEN];
 } governor_behavior_result_t;
 
-/* Perform behavioral analysis on code */
-int governor_analyze_behavior(const char *code, size_t size,
-                              governor_behavior_result_t *result);
+/*
+ * Analyze code for suspicious behavioral patterns.
+ * Returns 0 on success, -1 on error.
+ */
+int governor_analyze_behavior(const char *code, size_t code_size,
+                               governor_behavior_result_t *result);
 
-/* Get string representation of behavior flag */
-const char *governor_behavior_to_string(governor_behavior_t behavior);
+#else /* Freestanding kernel mode */
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Analysis Helpers (used internally)
- * ───────────────────────────────────────────────────────────────────────────── */
+/*
+ * Initialize the Governor system (freestanding singleton)
+ * Must be called early in kernel initialization, after heap is ready
+ */
+void governor_init(void);
 
-/* Pattern detection */
-int governor_detect_destructive(const char *code, size_t size,
-                                char *reason, size_t reason_size);
+#endif /* __STDC_HOSTED__ */
 
-/* Capability inference from code */
-uint32_t governor_infer_capabilities(const char *code, size_t size);
+/*
+ * Check if the Governor is initialized
+ */
+int governor_is_initialized(void);
 
-/* Threat level assessment */
-threat_level_t governor_assess_threat(governor_eval_request_t *request);
+/*
+ * Set Governor flags
+ */
+void governor_set_flags(uint32_t flags);
 
-/* Interactive prompt */
-int governor_prompt_user(phantom_governor_t *gov,
-                         governor_eval_request_t *request,
-                         const char *question);
+/*
+ * Get Governor flags
+ */
+uint32_t governor_get_flags(void);
 
-/* Logging */
-void governor_log_decision(phantom_governor_t *gov,
-                           governor_eval_request_t *request,
-                           governor_eval_response_t *response);
+/*============================================================================
+ * Policy Check API
+ *============================================================================*/
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Capability Helpers
- * ───────────────────────────────────────────────────────────────────────────── */
+/*
+ * Check a memory operation
+ * Returns verdict and optionally logs to audit trail
+ *
+ * @op:     Policy operation (POLICY_MEM_*)
+ * @ptr:    Memory address involved
+ * @size:   Size of operation
+ * @caps:   Capabilities of the requester
+ * @reason: Output buffer for denial reason (can be NULL)
+ */
+gov_verdict_t governor_check_memory(gov_policy_t op,
+                                     void *ptr,
+                                     size_t size,
+                                     gov_caps_t caps,
+                                     char *reason);
 
-/* Convert capability mask to string */
-const char *governor_cap_to_string(governor_capability_t cap);
+/*
+ * Check a process operation
+ *
+ * @op:         Policy operation (POLICY_PROC_*)
+ * @target_pid: Target process ID (if applicable)
+ * @caps:       Capabilities of the requester
+ * @reason:     Output buffer for denial reason (can be NULL)
+ */
+gov_verdict_t governor_check_process(gov_policy_t op,
+                                      uint32_t target_pid,
+                                      gov_caps_t caps,
+                                      char *reason);
 
-/* Convert string to capability (for parsing) */
-governor_capability_t governor_string_to_cap(const char *str);
+/*
+ * Check a filesystem operation
+ *
+ * @op:     Policy operation (POLICY_FS_*)
+ * @path:   Path involved (can be NULL)
+ * @caps:   Capabilities of the requester
+ * @reason: Output buffer for denial reason (can be NULL)
+ */
+gov_verdict_t governor_check_filesystem(gov_policy_t op,
+                                         const char *path,
+                                         gov_caps_t caps,
+                                         char *reason);
 
-/* Format capability mask as readable list */
-void governor_caps_to_list(uint32_t caps, char *buf, size_t size);
+/*============================================================================
+ * Convenience Macros
+ *============================================================================*/
 
-/* ─────────────────────────────────────────────────────────────────────────────
- * Threat Level Helpers
- * ───────────────────────────────────────────────────────────────────────────── */
+/*
+ * Quick check macros for common operations
+ */
 
-const char *governor_threat_to_string(threat_level_t level);
-const char *governor_threat_to_color(threat_level_t level);
+/* Check before freeing kernel memory */
+#define GOVERNOR_CHECK_FREE(ptr, size) \
+    governor_check_memory(POLICY_MEM_FREE, (ptr), (size), GOV_CAP_KERNEL, NULL)
 
-#endif /* PHANTOM_GOVERNOR_H */
+/* Check before killing a process */
+#define GOVERNOR_CHECK_KILL(pid) \
+    governor_check_process(POLICY_PROC_KILL, (pid), GOV_CAP_KERNEL, NULL)
+
+/* Check before deleting a file (will return TRANSFORM) */
+#define GOVERNOR_CHECK_DELETE(path) \
+    governor_check_filesystem(POLICY_FS_DELETE, (path), GOV_CAP_KERNEL, NULL)
+
+/*============================================================================
+ * Audit API
+ *============================================================================*/
+
+/*
+ * Get Governor statistics
+ */
+void governor_get_stats(struct gov_stats *stats);
+
+/*
+ * Get the number of audit entries
+ */
+int governor_audit_count(void);
+
+/*
+ * Get an audit entry by index (0 = most recent)
+ * Returns 0 on success, -1 on error
+ */
+int governor_audit_get(int index, struct gov_audit_entry *entry);
+
+/*
+ * Manually add an audit entry (for external subsystems)
+ */
+void governor_audit_record(gov_policy_t policy,
+                           gov_verdict_t verdict,
+                           uint32_t domain,
+                           uint64_t arg1,
+                           uint64_t arg2,
+                           const char *reason);
+
+/*============================================================================
+ * Utility Functions
+ *============================================================================*/
+
+/*
+ * Get policy name string
+ */
+const char *governor_policy_name(gov_policy_t policy);
+
+/*
+ * Get verdict name string
+ */
+const char *governor_verdict_name(gov_verdict_t verdict);
+
+/*
+ * Get domain name string
+ */
+const char *governor_domain_name(uint32_t domain);
+
+/*============================================================================
+ * Debug Functions
+ *============================================================================*/
+
+/*
+ * Dump Governor state to console
+ */
+void governor_dump_stats(void);
+void governor_dump_audit(int max_entries);
+
+/*============================================================================
+ * Integration Macros for Subsystems
+ *============================================================================*/
+
+/*
+ * Use in kfree() to enforce Governor policy:
+ *
+ * void kfree(void *ptr) {
+ *     GOVERNOR_ENFORCE_FREE(ptr, size);
+ *     // ... actual free logic
+ * }
+ */
+#define GOVERNOR_ENFORCE_FREE(ptr, size) \
+    do { \
+        if (governor_is_initialized()) { \
+            gov_verdict_t _v = GOVERNOR_CHECK_FREE(ptr, size); \
+            if (_v == GOV_DENY) { \
+                return; \
+            } \
+        } \
+    } while(0)
+
+/*
+ * Transform delete operations to hide:
+ *
+ * if (user_wants_delete(path)) {
+ *     GOVERNOR_TRANSFORM_DELETE(path, hide_function);
+ * }
+ */
+#define GOVERNOR_TRANSFORM_DELETE(path, hide_func) \
+    do { \
+        if (governor_is_initialized()) { \
+            gov_verdict_t _v = GOVERNOR_CHECK_DELETE(path); \
+            if (_v == GOV_DENY) { \
+                return -1; \
+            } else if (_v == GOV_TRANSFORM) { \
+                return hide_func(path); \
+            } \
+        } \
+    } while(0)
+
+#endif /* PHANTOMOS_KERNEL_GOVERNOR_H */
