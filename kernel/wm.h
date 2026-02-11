@@ -18,6 +18,8 @@
 #define WM_TITLE_HEIGHT     28      /* Title bar height in pixels */
 #define WM_BORDER_WIDTH     1       /* Window border width */
 #define WM_CLOSE_SIZE       18      /* Close button size */
+#define WM_BTN_SIZE         14      /* Minimize/maximize button size */
+#define WM_BTN_GAP          4       /* Gap between window buttons */
 #define WM_TITLE_MAX        64      /* Max title string length */
 #define WM_CORNER_RADIUS    8       /* Corner radius for windows */
 #define WM_SHADOW_OFFSET    4       /* Drop shadow offset */

@@ -62,6 +62,12 @@ int mouse_has_clicked(void);
 void mouse_inject_movement(int dx, int dy, uint8_t buttons);
 
 /*
+ * Set absolute mouse position (for USB tablet devices via VNC)
+ * x, y are in range [0, 32767] mapped to screen coordinates
+ */
+void mouse_set_absolute(int abs_x, int abs_y, uint8_t buttons);
+
+/*
  * Update mouse screen bounds (for dynamic resolution changes)
  */
 void mouse_set_bounds(int w, int h);

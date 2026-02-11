@@ -297,3 +297,29 @@ void mouse_inject_movement(int dx, int dy, uint8_t buttons)
         state.moved = 1;
     }
 }
+
+void mouse_set_absolute(int abs_x, int abs_y, uint8_t buttons)
+{
+    /* Map from USB tablet range [0, 32767] to screen coordinates */
+    int new_x = (abs_x * (screen_w - 1)) / 32767;
+    int new_y = (abs_y * (screen_h - 1)) / 32767;
+
+    /* Clamp to screen bounds */
+    if (new_x < 0) new_x = 0;
+    if (new_y < 0) new_y = 0;
+    if (new_x >= screen_w) new_x = screen_w - 1;
+    if (new_y >= screen_h) new_y = screen_h - 1;
+
+    if (new_x != state.x || new_y != state.y) {
+        state.moved = 1;
+    }
+
+    state.x = new_x;
+    state.y = new_y;
+
+    /* Update buttons */
+    if (buttons != state.buttons) {
+        state.clicked = 1;
+    }
+    state.buttons = buttons;
+}

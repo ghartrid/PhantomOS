@@ -49,6 +49,17 @@ void panel_draw_header(void)
 
     gfx_fill_gradient_v(0, 0, (int)w, HEADER_HEIGHT, 0xFF141B22, COLOR_HEADER_BG);
 
+    /* Inner glow: very subtle bright line near top */
+    {
+        uint32_t *backbuf = fb_get_backbuffer();
+        if (backbuf) {
+            for (int gx = 0; gx < (int)w; gx++) {
+                uint32_t *px = &backbuf[1 * w + gx];
+                *px = gfx_alpha_blend(0xFFFFFFFF, *px, 8);
+            }
+        }
+    }
+
     /* Accent line at bottom of header */
     gfx_draw_hline(0, HEADER_HEIGHT - 2, (int)w,
                    gfx_alpha_blend(COLOR_HIGHLIGHT, COLOR_HEADER_BG, 40));
@@ -140,8 +151,30 @@ void panel_draw_sidebar(int selected_category, const struct sidebar_category *ca
 
     fb_fill_rect(0, (uint32_t)y_start, SIDEBAR_WIDTH, (uint32_t)(y_end - y_start), COLOR_SIDEBAR_BG);
 
-    /* Right border */
+    /* Glass-effect: subtle top edge highlight */
+    {
+        uint32_t *bb = fb_get_backbuffer();
+        uint32_t fbw = fb_get_width();
+        if (bb) {
+            for (int gx = 0; gx < SIDEBAR_WIDTH - 1; gx++) {
+                uint32_t *px = &bb[y_start * fbw + gx];
+                *px = gfx_alpha_blend(0xFFFFFFFF, *px, 10);
+            }
+        }
+    }
+
+    /* Right border + highlight */
     gfx_draw_vline(SIDEBAR_WIDTH - 1, y_start, y_end - y_start, COLOR_PANEL_BORDER);
+    {
+        uint32_t *bb = fb_get_backbuffer();
+        uint32_t fbw = fb_get_width();
+        if (bb) {
+            for (int gy = y_start; gy < y_end; gy++) {
+                uint32_t *px = &bb[gy * fbw + SIDEBAR_WIDTH - 2];
+                *px = gfx_alpha_blend(0xFFFFFFFF, *px, 6);
+            }
+        }
+    }
 
     if (!cats) return;
 
@@ -214,8 +247,10 @@ void panel_draw_app_grid(const struct app_entry *apps, int count, int hover_idx)
     int y_start = CONTENT_Y;
     int y_end = DOCK_Y;
 
-    /* Fill center content area */
-    fb_fill_rect(CENTER_X, (uint32_t)y_start, CENTER_WIDTH, (uint32_t)(y_end - y_start), COLOR_CONTENT_BG);
+    /* Fill center content area with radial gradient (spotlight effect) */
+    gfx_fill_gradient_radial(CENTER_X, y_start, CENTER_WIDTH, y_end - y_start,
+                              CENTER_X + CENTER_WIDTH / 2, y_start + (y_end - y_start) / 2,
+                              0xFF101828, 0xFF060810);
 
     if (!apps || count <= 0) return;
 
@@ -240,9 +275,22 @@ void panel_draw_app_grid(const struct app_entry *apps, int count, int hover_idx)
         int card_w = APP_ICON_CELL_W - 2 * card_pad;
         int card_h = APP_ICON_CELL_H - 4;
         uint32_t card_bg = is_hover ? 0xFF182030 : 0xFF111827;
-        /* Drop shadow behind card */
-        gfx_draw_shadow(card_x, card_y, card_w, card_h, 2, 50);
-        gfx_fill_rounded_rect(card_x, card_y, card_w, card_h, 8, card_bg);
+        /* Soft shadow behind card */
+        gfx_draw_shadow(card_x, card_y, card_w, card_h, 2, 80);
+        gfx_fill_rounded_rect_aa(card_x, card_y, card_w, card_h, 8, card_bg);
+        /* Inner highlight on top edge */
+        {
+            uint32_t *bb = fb_get_backbuffer();
+            uint32_t fbw = fb_get_width();
+            if (bb && card_y + 1 >= 0) {
+                for (int gx = card_x + 4; gx < card_x + card_w - 4; gx++) {
+                    if (gx >= 0 && gx < (int)fbw) {
+                        uint32_t *px = &bb[(card_y + 1) * fbw + gx];
+                        *px = gfx_alpha_blend(0xFFFFFFFF, *px, 15);
+                    }
+                }
+            }
+        }
         if (is_hover) {
             /* Accent border on hover */
             gfx_draw_rounded_rect(card_x, card_y, card_w, card_h, 8, 0xFF2A4A6F);
@@ -535,8 +583,18 @@ void panel_draw_dock(const struct app_entry *apps, int count, int hover_idx)
 {
     uint32_t w = fb_get_width();
 
-    fb_fill_rect(0, DOCK_Y, w, DOCK_HEIGHT, COLOR_DOCK_BG);
+    gfx_fill_gradient_v(0, DOCK_Y, (int)w, DOCK_HEIGHT, 0xFF101820, COLOR_DOCK_BG);
     gfx_draw_hline(0, DOCK_Y, (int)w, COLOR_PANEL_BORDER);
+    /* Top edge glow */
+    {
+        uint32_t *bb = fb_get_backbuffer();
+        if (bb) {
+            for (int gx = 0; gx < (int)w; gx++) {
+                uint32_t *px = &bb[(DOCK_Y + 1) * w + gx];
+                *px = gfx_alpha_blend(0xFFFFFFFF, *px, 10);
+            }
+        }
+    }
 
     if (!apps || count <= 0) return;
 
@@ -578,11 +636,19 @@ void panel_draw_statusbar(void)
 {
     uint32_t w = fb_get_width();
 
-    /* 2px gradient transition from content bg to status bg */
-    gfx_fill_gradient_v(0, STATUS_Y, (int)w, 2, COLOR_CONTENT_BG, COLOR_STATUS_BG);
-    fb_fill_rect(0, STATUS_Y + 2, w, STATUS_HEIGHT - 2, COLOR_STATUS_BG);
+    /* Status bar gradient */
+    gfx_fill_gradient_v(0, STATUS_Y, (int)w, STATUS_HEIGHT, 0xFF0C1018, 0xFF060810);
     gfx_draw_hline(0, STATUS_Y, (int)w, 0xFF1E293B);
-    gfx_draw_hline(0, STATUS_Y + 1, (int)w, 0xFF141D2B);
+    /* Top border glow */
+    {
+        uint32_t *bb = fb_get_backbuffer();
+        if (bb) {
+            for (int gx = 0; gx < (int)w; gx++) {
+                uint32_t *px = &bb[(STATUS_Y + 1) * w + gx];
+                *px = gfx_alpha_blend(0xFFFFFFFF, *px, 12);
+            }
+        }
+    }
 
     /* Left text */
     font_draw_string(8, STATUS_Y + 2,

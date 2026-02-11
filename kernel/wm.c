@@ -91,8 +91,8 @@ static void z_remove(int id)
  *============================================================================*/
 
 /*
- * Draw a gradient title bar with rounded top corners only.
- * Combines gradient interpolation with corner-arc clipping in a single pass.
+ * Draw a gradient title bar with AA rounded top corners.
+ * Combines gradient interpolation with anti-aliased corner-arc clipping.
  */
 static void draw_title_gradient(int x, int y, int w, int h, int radius,
                                 uint32_t color_top, uint32_t color_bottom)
@@ -103,7 +103,8 @@ static void draw_title_gradient(int x, int y, int w, int h, int radius,
     if (!backbuf || w <= 0 || h <= 0) return;
 
     int r2 = radius * radius;
-    int rt = (color_top >> 16) & 0xFF, gt = (color_top >> 8) & 0xFF, bt = color_top & 0xFF;
+    int r_inner = (radius - 1) * (radius - 1);
+    int rt = (color_top >> 16) & 0xFF, gt_c = (color_top >> 8) & 0xFF, bt = color_top & 0xFF;
     int rb = (color_bottom >> 16) & 0xFF, gb = (color_bottom >> 8) & 0xFF, bb = color_bottom & 0xFF;
     int denom = (h > 1) ? (h - 1) : 1;
 
@@ -112,32 +113,53 @@ static void draw_title_gradient(int x, int y, int w, int h, int radius,
         if (py < 0 || py >= (int)fb_h) continue;
 
         int r = rt + (rb - rt) * row / denom;
-        int g = gt + (gb - gt) * row / denom;
+        int g = gt_c + (gb - gt_c) * row / denom;
         int b = bt + (bb - bt) * row / denom;
         uint32_t color = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 
-        int x_start = x;
-        int x_end = x + w;
-
-        /* Only round the top corners */
-        if (row < radius) {
+        if (row >= radius) {
+            /* Below corners: full-width solid fill */
+            int xs = (x < 0) ? 0 : x;
+            int xe = (x + w > (int)fb_w) ? (int)fb_w : x + w;
+            uint32_t *dst = &backbuf[py * fb_w + xs];
+            for (int col = xs; col < xe; col++)
+                *dst++ = color;
+        } else {
+            /* Corner rows: AA edge treatment */
             int dy = radius - 1 - row;
-            int inset = 0;
-            for (int dx = radius - 1; dx >= 0; dx--) {
-                if (dx * dx + dy * dy <= r2) { inset = dx; break; }
+            int dy2 = dy * dy;
+
+            for (int col = 0; col < w; col++) {
+                int px = x + col;
+                if (px < 0 || px >= (int)fb_w) continue;
+
+                int cx_off = -1;
+                if (col < radius) cx_off = radius - 1 - col;
+                else if (col >= w - radius) cx_off = col - (w - radius);
+
+                if (cx_off < 0) {
+                    backbuf[py * fb_w + px] = color;
+                    continue;
+                }
+
+                int dist2 = cx_off * cx_off + dy2;
+                if (dist2 <= r_inner) {
+                    backbuf[py * fb_w + px] = color;
+                } else if (dist2 <= r2 + radius) {
+                    int coverage = 255 - 255 * (dist2 - r_inner) / (r2 - r_inner + 1);
+                    if (coverage < 0) coverage = 0;
+                    if (coverage > 255) coverage = 255;
+                    if (coverage > 0) {
+                        uint32_t bg = backbuf[py * fb_w + px];
+                        backbuf[py * fb_w + px] = gfx_alpha_blend(color, bg, (uint8_t)coverage);
+                    }
+                }
             }
-            int skip = radius - 1 - inset;
-            x_start = x + skip;
-            x_end = x + w - skip;
         }
-
-        if (x_start < 0) x_start = 0;
-        if (x_end > (int)fb_w) x_end = (int)fb_w;
-
-        uint32_t *dst = &backbuf[py * fb_w + x_start];
-        for (int col = x_start; col < x_end; col++)
-            *dst++ = color;
     }
+
+    fb_mark_dirty((uint32_t)(x < 0 ? 0 : x), (uint32_t)(y < 0 ? 0 : y),
+                  (uint32_t)w, (uint32_t)h);
 }
 
 /*
@@ -154,24 +176,38 @@ static void draw_window(struct wm_window *win)
     int h = win->height;
     int rad = WM_CORNER_RADIUS;
 
-    /* 1. Drop shadow */
-    gfx_draw_shadow(x, y, w, h, WM_SHADOW_OFFSET, WM_SHADOW_ALPHA);
+    /* 1. Soft multi-layer drop shadow */
+    gfx_draw_soft_shadow(x, y, w, h, rad);
 
-    /* 2. Content area (rectangular, below title bar) */
+    /* 2. Content area with AA bottom corners */
     int content_y = y + WM_TITLE_HEIGHT;
     int content_h = h - WM_TITLE_HEIGHT;
     fb_fill_rect((uint32_t)x, (uint32_t)content_y,
                  (uint32_t)w, (uint32_t)content_h, COLOR_BG_PANEL);
 
-    /* 3. Title bar with gradient and rounded top corners */
-    uint32_t title_top = is_focused ? 0xFF152238 : 0xFF0A0A15;
+    /* 3. Title bar with gradient and AA rounded top corners */
+    uint32_t title_top = is_focused ? 0xFF182848 : 0xFF0A0A15;
     uint32_t title_bot = is_focused ? COLOR_TITLE_FOCUS : COLOR_TITLE_UNFOCUS;
     draw_title_gradient(x, y, w, WM_TITLE_HEIGHT, rad, title_top, title_bot);
 
-    /* 4. Subtle top-edge highlight (inside rounded corners) */
+    /* 4. Subtle top-edge highlight + inner glow */
     if (is_focused) {
         int hl_skip = rad / 2 + 1;
         gfx_draw_hline(x + hl_skip, y + 1, w - 2 * hl_skip, 0xFF2A4A7A);
+        /* Inner glow: very subtle bright line */
+        uint32_t *backbuf = fb_get_backbuffer();
+        uint32_t fb_w = fb_get_width();
+        if (backbuf) {
+            int glow_y = y + 2;
+            if (glow_y >= 0 && glow_y < (int)fb_get_height()) {
+                for (int gx = x + hl_skip; gx < x + w - hl_skip; gx++) {
+                    if (gx >= 0 && gx < (int)fb_w) {
+                        uint32_t *px = &backbuf[glow_y * fb_w + gx];
+                        *px = gfx_alpha_blend(0xFF4A6A9A, *px, 25);
+                    }
+                }
+            }
+        }
     }
 
     /* 5. Bottom border line on title bar */
@@ -188,12 +224,13 @@ static void draw_window(struct wm_window *win)
     font_draw_string((uint32_t)(x + 10), (uint32_t)text_y,
                      win->title, COLOR_TEXT, title_bot);
 
-    /* 8. Rounded close button with X drawn via lines */
+    /* 8. Window buttons: [minimize] [maximize] [close] */
     if (win->flags & WM_FLAG_CLOSEABLE) {
+        /* Close button (red, rightmost, larger) */
         int cbx = x + w - WM_CLOSE_SIZE - 6;
         int cby = y + (WM_TITLE_HEIGHT - WM_CLOSE_SIZE) / 2;
-        gfx_fill_rounded_rect(cbx, cby, WM_CLOSE_SIZE, WM_CLOSE_SIZE, 4,
-                              COLOR_CLOSE_BTN);
+        gfx_fill_rounded_rect_aa(cbx, cby, WM_CLOSE_SIZE, WM_CLOSE_SIZE, 4,
+                                 COLOR_CLOSE_BTN);
         int pad = 5;
         gfx_draw_line(cbx + pad, cby + pad,
                       cbx + WM_CLOSE_SIZE - pad - 1, cby + WM_CLOSE_SIZE - pad - 1,
@@ -201,6 +238,23 @@ static void draw_window(struct wm_window *win)
         gfx_draw_line(cbx + WM_CLOSE_SIZE - pad - 1, cby + pad,
                       cbx + pad, cby + WM_CLOSE_SIZE - pad - 1,
                       COLOR_WHITE);
+
+        /* Maximize button (green, middle) */
+        int mbx = cbx - WM_BTN_SIZE - WM_BTN_GAP;
+        int mby = y + (WM_TITLE_HEIGHT - WM_BTN_SIZE) / 2;
+        gfx_fill_rounded_rect_aa(mbx, mby, WM_BTN_SIZE, WM_BTN_SIZE, 3,
+                                 0xFF22C55E);
+        /* Square icon */
+        gfx_draw_rounded_rect(mbx + 3, mby + 3, WM_BTN_SIZE - 6, WM_BTN_SIZE - 6, 1,
+                               COLOR_WHITE);
+
+        /* Minimize button (yellow, leftmost) */
+        int nbx = mbx - WM_BTN_SIZE - WM_BTN_GAP;
+        int nby = y + (WM_TITLE_HEIGHT - WM_BTN_SIZE) / 2;
+        gfx_fill_rounded_rect_aa(nbx, nby, WM_BTN_SIZE, WM_BTN_SIZE, 3,
+                                 0xFFEAB308);
+        /* Horizontal line icon */
+        gfx_draw_hline(nbx + 3, nby + WM_BTN_SIZE / 2, WM_BTN_SIZE - 6, COLOR_WHITE);
     }
 
     /* 9. Blit content buffer */

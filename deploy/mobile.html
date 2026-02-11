@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>PhantomOS</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0e1a; }
+
+        #screen {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Connection status overlay */
+        #status {
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #9ca3af;
+            font-family: -apple-system, sans-serif;
+            font-size: 16px;
+            text-align: center;
+            z-index: 3000;
+            pointer-events: none;
+        }
+        #status.hidden { display: none; }
+
+        /* Touch overlay — only active in trackpad/right-click modes */
+        #touch-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            z-index: 500;
+            touch-action: none;
+            display: none;
+        }
+        #touch-overlay.active { display: block; }
+
+        /* Virtual cursor for trackpad mode */
+        #vcursor {
+            position: fixed;
+            width: 12px; height: 12px;
+            border-radius: 50%;
+            border: 2px solid #fff;
+            background: rgba(59, 130, 246, 0.6);
+            box-shadow: 0 0 6px rgba(59, 130, 246, 0.5);
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 600;
+            display: none;
+        }
+        #vcursor.show { display: block; }
+
+        /* Floating touch controls */
+        #touch-controls {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            z-index: 1000;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+        #touch-controls:active { opacity: 1; }
+
+        .ctrl-btn {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            border: 2px solid rgba(255,255,255,0.3);
+            background: rgba(10, 14, 26, 0.85);
+            color: #fff;
+            font-size: 16px;
+            font-family: -apple-system, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+        }
+        .ctrl-btn.active {
+            background: rgba(59, 130, 246, 0.8);
+            border-color: rgba(59, 130, 246, 0.9);
+        }
+        .ctrl-btn:active { transform: scale(0.9); }
+
+        /* Mode indicator */
+        #mode-label {
+            position: fixed;
+            top: 8px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(10, 14, 26, 0.85);
+            color: #e5e7eb;
+            font-family: -apple-system, sans-serif;
+            font-size: 13px;
+            padding: 5px 14px;
+            border-radius: 14px;
+            z-index: 1000;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        #mode-label.show { opacity: 1; }
+
+        /* Keyboard bar */
+        #kb-bar {
+            display: none;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 44px;
+            background: rgba(10, 14, 26, 0.95);
+            border-top: 1px solid rgba(255,255,255,0.1);
+            z-index: 1001;
+            flex-direction: row;
+            align-items: center;
+            gap: 4px;
+            padding: 0 8px;
+            overflow-x: auto;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+        }
+        #kb-bar.show { display: flex; }
+        .kb-key {
+            min-width: 36px;
+            height: 32px;
+            border-radius: 6px;
+            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            font-size: 12px;
+            font-family: monospace;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 8px;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            flex-shrink: 0;
+        }
+        .kb-key:active { background: rgba(59, 130, 246, 0.5); }
+        .kb-key.held { background: rgba(220, 38, 38, 0.6); border-color: rgba(220, 38, 38, 0.8); }
+
+        /* Help overlay */
+        #help-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.88);
+            z-index: 2000;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        #help-overlay.show { display: flex; }
+        #help-overlay h2 {
+            color: #fff;
+            font-family: -apple-system, sans-serif;
+            font-size: 20px;
+            margin-bottom: 20px;
+        }
+        .help-row {
+            color: #d1d5db;
+            font-family: -apple-system, sans-serif;
+            font-size: 14px;
+            line-height: 2.2;
+        }
+        .help-row b { color: #60a5fa; }
+        #help-close {
+            margin-top: 24px;
+            padding: 10px 32px;
+            border-radius: 8px;
+            border: none;
+            background: #3b82f6;
+            color: #fff;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        /* Desktop: hide mobile controls and overlay */
+        @media (min-width: 800px) and (pointer: fine) {
+            #touch-controls { display: none; }
+            #mode-label { display: none; }
+            #touch-overlay { display: none; }
+            #vcursor { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <div id="screen"></div>
+    <div id="status">Connecting to PhantomOS...</div>
+    <div id="touch-overlay"></div>
+    <div id="vcursor"></div>
+    <div id="mode-label">Tap</div>
+
+    <div id="touch-controls">
+        <button class="ctrl-btn" id="btn-mouse" title="Enable Mouse">M</button>
+        <button class="ctrl-btn" id="btn-help" title="Help">?</button>
+        <button class="ctrl-btn" id="btn-kb" title="Keyboard">Kb</button>
+        <button class="ctrl-btn" id="btn-right" title="Right Click">R</button>
+        <button class="ctrl-btn" id="btn-track" title="Trackpad Mode">T</button>
+    </div>
+
+    <div id="kb-bar">
+        <div class="kb-key" data-key="Escape">Esc</div>
+        <div class="kb-key" data-key="Tab">Tab</div>
+        <div class="kb-key kb-toggle" data-key="Control">Ctrl</div>
+        <div class="kb-key kb-toggle" data-key="Alt">Alt</div>
+        <div class="kb-key" data-key="ArrowUp">&uarr;</div>
+        <div class="kb-key" data-key="ArrowDown">&darr;</div>
+        <div class="kb-key" data-key="ArrowLeft">&larr;</div>
+        <div class="kb-key" data-key="ArrowRight">&rarr;</div>
+        <div class="kb-key" data-key="Enter">Ent</div>
+        <div class="kb-key" data-key="Backspace">Bksp</div>
+        <div class="kb-key" data-key="Delete">Del</div>
+        <div class="kb-key" data-key="F1">F1</div>
+        <div class="kb-key" data-key="F5">F5</div>
+        <div class="kb-key" data-key="F11">F11</div>
+    </div>
+
+    <div id="help-overlay">
+        <h2>PhantomOS Touch Controls</h2>
+        <div class="help-row"><b>M button</b> = Enable/disable mouse (starts off)</div>
+        <div class="help-row"><b>Tap</b> = Move cursor + left click (when mouse on)</div>
+        <div class="help-row"><b>T button</b> = Trackpad mode (drag to move cursor)</div>
+        <div class="help-row"><b>R button</b> = Right-click (next tap)</div>
+        <div class="help-row"><b>Kb button</b> = Special keys bar</div>
+        <div class="help-row"><b>Ctrl/Alt</b> = Hold (tap to toggle, red = held)</div>
+        <div class="help-row"><b>Two-finger tap</b> = Right click</div>
+        <br>
+        <div class="help-row" style="color:#9ca3af;font-size:12px;">Tip: Landscape mode gives a better view</div>
+        <button id="help-close">Got it</button>
+    </div>
+
+    <script type="module">
+        import RFB from './core/rfb.js';
+
+        var isMobile = ('ontouchstart' in window || navigator.maxTouchPoints > 0)
+            && window.matchMedia('(max-width: 800px), (pointer: coarse)').matches;
+
+        // --- Connect to VNC ---
+        const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        const url = protocol + '://' + location.host + '/websockify';
+        const screenEl = document.getElementById('screen');
+        const statusEl = document.getElementById('status');
+
+        const rfb = new RFB(screenEl, url);
+        rfb.scaleViewport = true;
+        rfb.viewOnly = isMobile;
+
+        // Center the VNC cursor after connection
+        function centerCursor() {
+            var canvas = screenEl.querySelector('canvas');
+            if (!canvas) return;
+            var rect = canvas.getBoundingClientRect();
+            var cx = rect.left + rect.width / 2;
+            var cy = rect.top + rect.height / 2;
+            // Move then click-release to force cursor position update
+            canvas.dispatchEvent(new PointerEvent('pointermove', {
+                clientX: cx, clientY: cy, bubbles: true,
+                pointerType: 'mouse', pointerId: 1, isPrimary: true
+            }));
+            canvas.dispatchEvent(new PointerEvent('pointerdown', {
+                clientX: cx, clientY: cy, button: 0, buttons: 1,
+                bubbles: true, pointerType: 'mouse', pointerId: 1, isPrimary: true
+            }));
+            canvas.dispatchEvent(new PointerEvent('pointerup', {
+                clientX: cx, clientY: cy, button: 0, buttons: 0,
+                bubbles: true, pointerType: 'mouse', pointerId: 1, isPrimary: true
+            }));
+        }
+
+        rfb.addEventListener('connect', function() {
+            statusEl.classList.add('hidden');
+            // Wait for canvas to be rendered, then center cursor
+            setTimeout(centerCursor, 500);
+            setTimeout(centerCursor, 1000);
+        });
+        rfb.addEventListener('disconnect', function(e) {
+            statusEl.textContent = e.detail.clean ? 'Disconnected.' : 'Connection lost. Reload to reconnect.';
+            statusEl.classList.remove('hidden');
+        });
+        rfb.addEventListener('credentialsrequired', function() {
+            var pw = prompt('VNC Password:');
+            if (pw) rfb.sendCredentials({ password: pw });
+        });
+
+        // --- Get canvas reference (created by RFB inside screenEl) ---
+        function getCanvas() {
+            return screenEl.querySelector('canvas');
+        }
+
+        // --- UI Elements ---
+        var modeLabel = document.getElementById('mode-label');
+        var btnMouse = document.getElementById('btn-mouse');
+        var btnRight = document.getElementById('btn-right');
+        var btnTrack = document.getElementById('btn-track');
+        var btnKb = document.getElementById('btn-kb');
+        var btnHelp = document.getElementById('btn-help');
+        var kbBar = document.getElementById('kb-bar');
+        var helpOverlay = document.getElementById('help-overlay');
+        var helpClose = document.getElementById('help-close');
+        var touchOverlay = document.getElementById('touch-overlay');
+        var vcursor = document.getElementById('vcursor');
+
+        // --- Mode State ---
+        var mouseActive = false;
+        var trackpadMode = false;
+        var rightClickMode = false;
+        var kbVisible = false;
+
+        // --- Mouse Toggle ---
+        btnMouse.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            mouseActive = !mouseActive;
+            rfb.viewOnly = !mouseActive;
+            btnMouse.classList.toggle('active', mouseActive);
+            showMode(mouseActive ? 'Mouse ON' : 'Mouse OFF');
+        });
+
+        // Virtual cursor position (CSS pixels, relative to viewport)
+        var vcx = window.innerWidth / 2;
+        var vcy = window.innerHeight / 2;
+
+        function showMode(text) {
+            modeLabel.textContent = text;
+            modeLabel.classList.add('show');
+            clearTimeout(showMode._t);
+            showMode._t = setTimeout(function() {
+                modeLabel.classList.remove('show');
+            }, 1500);
+        }
+
+        // --- Trackpad Mode ---
+        btnTrack.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            trackpadMode = !trackpadMode;
+            btnTrack.classList.toggle('active', trackpadMode);
+
+            if (trackpadMode) {
+                rightClickMode = false;
+                btnRight.classList.remove('active');
+                vcx = window.innerWidth / 2;
+                vcy = window.innerHeight / 2;
+                updateVCursor();
+                vcursor.classList.add('show');
+                touchOverlay.classList.add('active');
+                showMode('Trackpad');
+                sendPointerToCanvas(vcx, vcy, 0);
+            } else {
+                vcursor.classList.remove('show');
+                touchOverlay.classList.remove('active');
+                showMode('Tap');
+            }
+        });
+
+        // --- Right Click Mode ---
+        btnRight.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            rightClickMode = !rightClickMode;
+            btnRight.classList.toggle('active', rightClickMode);
+
+            if (rightClickMode) {
+                trackpadMode = false;
+                btnTrack.classList.remove('active');
+                vcursor.classList.remove('show');
+                touchOverlay.classList.add('active');
+                showMode('Right Click');
+            } else {
+                touchOverlay.classList.remove('active');
+                showMode('Tap');
+            }
+        });
+
+        // --- Keyboard Bar ---
+        btnKb.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            kbVisible = !kbVisible;
+            kbBar.classList.toggle('show', kbVisible);
+            btnKb.classList.toggle('active', kbVisible);
+        });
+
+        // --- Help ---
+        btnHelp.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            helpOverlay.classList.add('show');
+        });
+        helpClose.addEventListener('click', function(e) {
+            e.preventDefault();
+            helpOverlay.classList.remove('show');
+        });
+
+        // --- Keysym Map ---
+        var keysymMap = {
+            'Escape': 0xff1b, 'Tab': 0xff09, 'Control': 0xffe3,
+            'Alt': 0xffe9, 'ArrowUp': 0xff52, 'ArrowDown': 0xff54,
+            'ArrowLeft': 0xff51, 'ArrowRight': 0xff53, 'Enter': 0xff0d,
+            'Backspace': 0xff08, 'Delete': 0xffff,
+            'F1': 0xffbe, 'F5': 0xffc2, 'F11': 0xffc8
+        };
+
+        // --- Special Key Buttons ---
+        // Modifier keys (Ctrl, Alt) act as toggles - press once to hold, again to release
+        var heldKeys = {};
+
+        document.querySelectorAll('.kb-key').forEach(function(el) {
+            el.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var keyName = this.getAttribute('data-key');
+                var keysym = keysymMap[keyName];
+                if (!keysym) return;
+
+                var isToggle = this.classList.contains('kb-toggle');
+                if (isToggle) {
+                    // Toggle hold state
+                    if (heldKeys[keyName]) {
+                        rfb.sendKey(keysym, keyName, false);
+                        delete heldKeys[keyName];
+                        this.classList.remove('held');
+                    } else {
+                        rfb.sendKey(keysym, keyName, true);
+                        heldKeys[keyName] = true;
+                        this.classList.add('held');
+                    }
+                } else {
+                    // Normal key: press and release
+                    rfb.sendKey(keysym, keyName, true);
+                    setTimeout(function() {
+                        rfb.sendKey(keysym, keyName, false);
+                        // Release any held modifiers after a normal key press
+                        releaseHeldKeys();
+                    }, 50);
+                }
+
+                rfb.focus();
+            });
+        });
+
+        function releaseHeldKeys() {
+            for (var keyName in heldKeys) {
+                var keysym = keysymMap[keyName];
+                rfb.sendKey(keysym, keyName, false);
+                var el = document.querySelector('.kb-key[data-key="' + keyName + '"]');
+                if (el) el.classList.remove('held');
+            }
+            heldKeys = {};
+        }
+
+        // --- Virtual Cursor ---
+        function updateVCursor() {
+            vcursor.style.left = vcx + 'px';
+            vcursor.style.top = vcy + 'px';
+        }
+
+        // --- Send pointer event to canvas ---
+        // Dispatches a PointerEvent at the given viewport coordinates
+        // so noVNC's internal handler picks it up and sends to VNC server
+        function sendPointerToCanvas(clientX, clientY, buttons) {
+            var canvas = getCanvas();
+            if (!canvas) return;
+
+            canvas.dispatchEvent(new PointerEvent('pointermove', {
+                clientX: clientX, clientY: clientY,
+                bubbles: true, cancelable: true,
+                pointerType: 'mouse', pointerId: 1,
+                buttons: buttons, isPrimary: true
+            }));
+        }
+
+        function sendClickToCanvas(clientX, clientY, button) {
+            var canvas = getCanvas();
+            if (!canvas) return;
+
+            // button: 0=left, 2=right
+            var buttons = button === 2 ? 2 : 1;
+
+            // Move cursor to position first
+            canvas.dispatchEvent(new PointerEvent('pointermove', {
+                clientX: clientX, clientY: clientY,
+                bubbles: true, cancelable: true,
+                pointerType: 'mouse', pointerId: 1,
+                buttons: 0, isPrimary: true
+            }));
+
+            // Mouse down
+            canvas.dispatchEvent(new PointerEvent('pointerdown', {
+                clientX: clientX, clientY: clientY,
+                button: button, buttons: buttons,
+                bubbles: true, cancelable: true,
+                pointerType: 'mouse', pointerId: 1,
+                isPrimary: true
+            }));
+
+            // Mouse up after short delay
+            setTimeout(function() {
+                canvas.dispatchEvent(new PointerEvent('pointerup', {
+                    clientX: clientX, clientY: clientY,
+                    button: button, buttons: 0,
+                    bubbles: true, cancelable: true,
+                    pointerType: 'mouse', pointerId: 1,
+                    isPrimary: true
+                }));
+            }, 40);
+        }
+
+        // --- Touch Handling (all modes) ---
+        var touchStart = null;
+        var touchTime = 0;
+        var touchMoved = false;
+
+        // Double-tap tracking: snap second tap to first tap position
+        var lastTapPos = null;
+        var lastTapTime = 0;
+        var DOUBLE_TAP_MS = 350;
+        var DOUBLE_TAP_PX = 30;
+
+        touchOverlay.addEventListener('touchstart', function(e) {
+            e.preventDefault();
+            if (e.touches.length === 1) {
+                touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+                touchTime = Date.now();
+                touchMoved = false;
+            }
+        }, { passive: false });
+
+        touchOverlay.addEventListener('touchmove', function(e) {
+            e.preventDefault();
+            if (!touchStart || e.touches.length !== 1) return;
+
+            var x = e.touches[0].clientX;
+            var y = e.touches[0].clientY;
+            var dx = x - touchStart.x;
+            var dy = y - touchStart.y;
+
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+                touchMoved = true;
+            }
+
+            if (trackpadMode && touchMoved) {
+                // Move virtual cursor by the delta
+                vcx = Math.max(0, Math.min(window.innerWidth, vcx + dx));
+                vcy = Math.max(0, Math.min(window.innerHeight, vcy + dy));
+                updateVCursor();
+                sendPointerToCanvas(vcx, vcy, 0);
+                touchStart.x = x;
+                touchStart.y = y;
+            }
+        }, { passive: false });
+
+        touchOverlay.addEventListener('touchend', function(e) {
+            e.preventDefault();
+            var elapsed = Date.now() - touchTime;
+            if (!touchStart) return;
+
+            var isTap = !touchMoved && elapsed < 400;
+
+            if (rightClickMode && isTap) {
+                // Right-click at touch position
+                sendClickToCanvas(touchStart.x, touchStart.y, 2);
+                rightClickMode = false;
+                btnRight.classList.remove('active');
+                touchOverlay.classList.remove('active');
+                showMode('Tap');
+            } else if (trackpadMode && isTap) {
+                // Tap in trackpad mode = click at virtual cursor position
+                sendClickToCanvas(vcx, vcy, 0);
+            }
+
+            touchStart = null;
+        }, { passive: false });
+
+        // Two-finger tap for right-click (works everywhere on the canvas)
+        var twoFingerStart = 0;
+        document.addEventListener('touchstart', function(e) {
+            if (e.touches.length === 2) {
+                twoFingerStart = Date.now();
+            }
+        }, { passive: true });
+
+        document.addEventListener('touchend', function(e) {
+            if (e.touches.length === 0 && twoFingerStart > 0) {
+                var elapsed = Date.now() - twoFingerStart;
+                twoFingerStart = 0;
+                if (elapsed < 400 && e.changedTouches.length > 0) {
+                    var t = e.changedTouches[0];
+                    sendClickToCanvas(t.clientX, t.clientY, 2);
+                }
+            }
+        }, { passive: true });
+
+        // --- First Visit Help ---
+        if (!localStorage.getItem('phantomos-help-seen')) {
+            if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+                setTimeout(function() {
+                    helpOverlay.classList.add('show');
+                    localStorage.setItem('phantomos-help-seen', '1');
+                }, 2000);
+            }
+        }
+    </script>
+</body>
+</html>

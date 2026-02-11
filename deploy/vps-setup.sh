@@ -343,9 +343,9 @@ server {
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
-    # Redirect root to vnc.html
+    # Redirect root to noVNC client
     location = / {
-        return 301 /vnc.html;
+        return 301 /vnc.html?autoconnect=true&resize=scale;
     }
 
     # noVNC web interface

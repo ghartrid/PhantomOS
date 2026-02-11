@@ -153,10 +153,23 @@ static void hid_process_mouse(struct usb_hid_device *hid,
     if (len < 3) return;
 
     uint8_t buttons = report[0] & 0x07;
-    int8_t dx = (int8_t)report[1];
-    int8_t dy = (int8_t)report[2];
 
-    mouse_inject_movement(dx, dy, buttons);
+    /* USB tablet devices (e.g. QEMU -usbdevice tablet) send 6-byte reports
+     * with 16-bit absolute X/Y coordinates in range [0, 32767]:
+     *   Byte 0: buttons
+     *   Bytes 1-2: X absolute (little-endian, 16-bit)
+     *   Bytes 3-4: Y absolute (little-endian, 16-bit)
+     *   Byte 5: wheel (optional)
+     * Standard USB mice send 3-4 byte reports with 8-bit relative deltas. */
+    if (len >= 6) {
+        int abs_x = (int)(report[1] | ((uint16_t)report[2] << 8));
+        int abs_y = (int)(report[3] | ((uint16_t)report[4] << 8));
+        mouse_set_absolute(abs_x, abs_y, buttons);
+    } else {
+        int8_t dx = (int8_t)report[1];
+        int8_t dy = (int8_t)report[2];
+        mouse_inject_movement(dx, dy, buttons);
+    }
 }
 
 /*============================================================================

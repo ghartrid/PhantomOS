@@ -280,14 +280,31 @@ static struct {
 } fb;
 
 /*============================================================================
- * ArtOS State (Digital Art Studio)
+ * ArtOS State (Digital Art Studio) — v2 Overhaul
  *============================================================================*/
 
-/* Canvas dimensions (pixel art size, displayed at scale in window) */
-#define ARTOS_CANVAS_W      128
-#define ARTOS_CANVAS_H      96
-#define ARTOS_MAX_UNDO      32
+/* Canvas dimensions */
+#define ARTOS_CANVAS_W      400
+#define ARTOS_CANVAS_H      300
+#define ARTOS_MAX_UNDO      10
+#define ARTOS_MAX_LAYERS    4
 #define ARTOS_PALETTE_COUNT 16
+#define ARTOS_MAX_POLY_VERTS 32
+#define ARTOS_MAX_BRUSH     10
+#define ARTOS_MAX_OPACITY   255
+#define ARTOS_OPACITY_STEP  16
+
+/* Layout constants */
+#define ARTOS_TOOLBAR_H     132
+#define ARTOS_PALETTE_H     44
+#define ARTOS_LAYER_PANEL_W 60
+#define ARTOS_MARGIN        8
+#define ARTOS_BTN_W         44
+#define ARTOS_BTN_H         18
+#define ARTOS_BTN_GAP       2
+#define ARTOS_HUE_BAR_W     128
+#define ARTOS_HUE_BAR_H     12
+#define ARTOS_SV_BOX_SIZE   32
 
 /* Tool types */
 #define ARTOS_TOOL_PENCIL   0
@@ -298,10 +315,29 @@ static struct {
 #define ARTOS_TOOL_FILL     5
 #define ARTOS_TOOL_ERASER   6
 #define ARTOS_TOOL_EYEDROP  7
-#define ARTOS_TOOL_COUNT    8
+#define ARTOS_TOOL_TEXT     8
+#define ARTOS_TOOL_POLYGON  9
+#define ARTOS_TOOL_SPRAY    10
+#define ARTOS_TOOL_SELECT   11
+#define ARTOS_TOOL_RNDRECT  12
+#define ARTOS_TOOL_CIRCLE   13
+#define ARTOS_TOOL_STAR     14
+#define ARTOS_TOOL_ARROW    15
+#define ARTOS_TOOL_BEZIER   16
+#define ARTOS_TOOL_GRADFILL 17
+#define ARTOS_TOOL_DITHFILL 18
+#define ARTOS_TOOL_CALLIG   19
+#define ARTOS_TOOL_SOFTBRUSH 20
+#define ARTOS_TOOL_PATBRUSH 21
+#define ARTOS_TOOL_CLONE    22
+#define ARTOS_TOOL_SMUDGE   23
+#define ARTOS_TOOL_COUNT    24
 
 static const char *artos_tool_names[ARTOS_TOOL_COUNT] = {
-    "Pencil", "Line", "Rect", "FillR", "Ellip", "Fill", "Erase", "Pick"
+    "Pencil", "Line", "Rect", "FillR", "Ellip", "Fill",
+    "Erase", "Pick", "Text", "Poly", "Spray", "Select",
+    "RndRc", "Circl", "Star", "Arrow", "Bezir", "GradF",
+    "DithF", "Calli", "SoftB", "PatBr", "Clone", "Smudg"
 };
 
 static const uint32_t artos_palette[ARTOS_PALETTE_COUNT] = {
@@ -311,59 +347,115 @@ static const uint32_t artos_palette[ARTOS_PALETTE_COUNT] = {
     0xFF000080, 0xFF808000, 0xFF800080, 0xFF008080,
 };
 
-static struct {
-    /* Canvas pixel data */
-    uint32_t    canvas[ARTOS_CANVAS_W * ARTOS_CANVAS_H];
+/* Layer structure */
+struct artos_layer {
+    uint32_t    pixels[ARTOS_CANVAS_W * ARTOS_CANVAS_H];
+    uint8_t     visible;
+    uint8_t     opacity;    /* 0-255 */
+    char        name[8];    /* "Layer 1" etc */
+};
 
-    /* Undo stack: each entry is a full canvas snapshot */
+static struct {
+    /* Layer stack */
+    struct artos_layer layers[ARTOS_MAX_LAYERS];
+    int         active_layer;
+    int         layer_count;        /* 1-4 */
+
+    /* Composite canvas (flattened for display) */
+    uint32_t    composite[ARTOS_CANVAS_W * ARTOS_CANVAS_H];
+
+    /* Undo stack: snapshots of active layer only */
     uint32_t    undo[ARTOS_MAX_UNDO][ARTOS_CANVAS_W * ARTOS_CANVAS_H];
     int         undo_count;
-    int         undo_pos;           /* Next write position */
+    int         undo_pos;
 
     /* Current tool and colors */
     int         tool;
     uint32_t    fg_color;
-    uint32_t    bg_color;           /* Eraser color / canvas background */
-    int         brush_size;         /* 1-5 pixels */
+    uint32_t    bg_color;
+    int         brush_size;         /* 1-10 */
+    int         brush_opacity;      /* 0-255 */
 
-    /* Shape drawing state (for line/rect/ellipse) */
-    int         drawing;            /* 1 = mouse is down on canvas */
-    int         start_cx, start_cy; /* Canvas coords at mouse-down */
-    int         last_cx, last_cy;   /* Last canvas coords for pencil */
-
-    /* Saved canvas for shape preview (during drag) */
+    /* Shape drawing state */
+    int         drawing;
+    int         start_cx, start_cy;
+    int         last_cx, last_cy;
     uint32_t    shape_save[ARTOS_CANVAS_W * ARTOS_CANVAS_H];
 
-    /* UI layout constants (computed on paint) */
-    int         toolbar_h;          /* Top toolbar area */
-    int         palette_h;          /* Bottom palette area */
-    int         canvas_ox, canvas_oy; /* Canvas pixel origin in content area */
-    int         pixel_scale;        /* Scale factor for canvas pixels */
+    /* Zoom and pan */
+    int         zoom;               /* 1, 2, or 3 */
+    int         scroll_x, scroll_y; /* Pan offset in canvas pixels */
 
-    /* Modified flag */
+    /* Text tool state */
+    char        text_buf[128];
+    int         text_cursor;
+    int         text_cx, text_cy;   /* Canvas insertion point */
+    int         text_active;
+
+    /* Polygon tool state */
+    int         poly_verts[ARTOS_MAX_POLY_VERTS][2];
+    int         poly_count;
+
+    /* Selection tool state */
+    int         sel_active;
+    int         sel_x1, sel_y1, sel_x2, sel_y2;
+    int         sel_moving;
+    int         sel_move_ox, sel_move_oy;
+    uint32_t    sel_buf[ARTOS_CANVAS_W * ARTOS_CANVAS_H];
+
+    /* Bezier tool state */
+    int         bezier_pts[4][2];
+    int         bezier_count;
+
+    /* Star tool */
+    int         star_sides;         /* 3-8 */
+
+    /* Clone stamp state */
+    int         clone_src_x, clone_src_y;
+    int         clone_src_set;
+    int         clone_off_x, clone_off_y;
+
+    /* Smudge tool buffer (max 21x21 brush area) */
+    uint32_t    smudge_buf[441];
+
+    /* Edit modes */
+    int         mirror_mode;
+    int         grid_snap;
+    int         grid_size;          /* 4 or 8 */
+
+    /* HSV color picker state */
+    int         hsv_h;              /* 0-359 */
+    int         hsv_s;              /* 0-255 */
+    int         hsv_v;              /* 0-255 */
+
+    /* UI layout (computed on paint) */
+    int         toolbar_h;
+    int         palette_h;
+    int         canvas_ox, canvas_oy;
+    int         pixel_scale;
+
     int         modified;
 
     /* AI Art Generator */
-    char        ai_prompt[64];      /* User's text prompt */
-    int         ai_prompt_cursor;   /* Text cursor position */
-    int         ai_input_active;    /* 1 if typing in AI prompt field */
-    uint32_t    ai_rand_seed;       /* PRNG seed for reproducibility */
+    char        ai_prompt[64];
+    int         ai_prompt_cursor;
+    int         ai_input_active;
+    uint32_t    ai_rand_seed;
 
     /* DrawNet Collaboration */
-    int         drawnet_enabled;    /* 1 if session active */
-    char        drawnet_session_id[16]; /* Session ID (e.g., "ART001") */
-    uint64_t    drawnet_last_sync_ms;   /* Timer for polling */
-    int         drawnet_peer_count;     /* Number of active peers */
+    int         drawnet_enabled;
+    char        drawnet_session_id[16];
+    uint64_t    drawnet_last_sync_ms;
+    int         drawnet_peer_count;
     struct {
-        char        name[16];       /* Peer identifier */
-        int         cursor_x;       /* Last known cursor X */
-        int         cursor_y;       /* Last known cursor Y */
-        uint32_t    color;          /* Peer cursor color */
-        uint64_t    last_seen_ms;   /* Timeout detection */
-    } drawnet_peers[8];             /* Max 8 peers */
-    uint32_t    drawnet_stroke_seq; /* Local stroke sequence number */
-    char        drawnet_input[16];  /* Session ID input field */
-    int         drawnet_input_active; /* 1 if typing in session field */
+        char        name[16];
+        int         cursor_x, cursor_y;
+        uint32_t    color;
+        uint64_t    last_seen_ms;
+    } drawnet_peers[8];
+    uint32_t    drawnet_stroke_seq;
+    char        drawnet_input[16];
+    int         drawnet_input_active;
 } art;
 
 /*============================================================================
@@ -5759,27 +5851,148 @@ static void desktoplab_click(struct wm_window *win, int x, int y, int btn)
  * "Every stroke preserved in geological layers"
  *============================================================================*/
 
+/* --- Math utilities (integer only, no FPU) --- */
+
+/* Integer square root via Newton's method */
+static int isqrt(int n)
+{
+    if (n <= 0) return 0;
+    int x = n;
+    int y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return x;
+}
+
+/* Sine lookup table: isin_table[d] = sin(d°) * 1024, for d=0..90 */
+static const int isin_table[91] = {
+       0,   18,   36,   54,   71,   89,  107,  125,  143,  160,
+     178,  195,  213,  230,  248,  265,  282,  299,  316,  333,
+     350,  367,  384,  400,  416,  433,  449,  465,  481,  496,
+     512,  527,  543,  558,  573,  588,  602,  617,  631,  645,
+     659,  673,  687,  700,  714,  727,  740,  752,  765,  777,
+     789,  801,  813,  824,  836,  847,  857,  868,  878,  888,
+     898,  908,  917,  926,  935,  944,  953,  961,  969,  977,
+     985,  992,  999, 1005, 1012, 1018, 1024, 1023, 1022, 1021,
+    1020, 1019, 1018, 1016, 1014, 1012, 1009, 1007, 1004, 1001,
+    1024
+};
+
+/* Fixed-point sine: returns sin(deg) * 1024, range [-1024, 1024] */
+static int isin(int deg)
+{
+    deg = deg % 360;
+    if (deg < 0) deg += 360;
+    if (deg <= 90) return isin_table[deg];
+    if (deg <= 180) return isin_table[180 - deg];
+    if (deg <= 270) return -isin_table[deg - 180];
+    return -isin_table[360 - deg];
+}
+
+/* Fixed-point cosine: returns cos(deg) * 1024 */
+static int icos(int deg) { return isin(deg + 90); }
+
+/* Grid snap helper */
+static void artos_snap(int *cx, int *cy)
+{
+    if (!art.grid_snap) return;
+    int g = art.grid_size;
+    *cx = ((*cx + g / 2) / g) * g;
+    *cy = ((*cy + g / 2) / g) * g;
+    if (*cx >= ARTOS_CANVAS_W) *cx = ARTOS_CANVAS_W - 1;
+    if (*cy >= ARTOS_CANVAS_H) *cy = ARTOS_CANVAS_H - 1;
+}
+
+/* --- HSV color conversion (integer math only) --- */
+static uint32_t hsv_to_rgb(int h, int s, int v)
+{
+    if (s == 0) return 0xFF000000 | ((uint32_t)v << 16) | ((uint32_t)v << 8) | (uint32_t)v;
+    while (h < 0) h += 360;
+    while (h >= 360) h -= 360;
+    int sector = h / 60;
+    int rem = h - sector * 60;
+    int p = (v * (255 - s)) / 255;
+    int q = (v * (255 * 60 - s * rem)) / (255 * 60);
+    int t = (v * (255 * 60 - s * (60 - rem))) / (255 * 60);
+    int r, g, b;
+    switch (sector) {
+        case 0: r=v; g=t; b=p; break;
+        case 1: r=q; g=v; b=p; break;
+        case 2: r=p; g=v; b=t; break;
+        case 3: r=p; g=q; b=v; break;
+        case 4: r=t; g=p; b=v; break;
+        default: r=v; g=p; b=q; break;
+    }
+    if (r<0) r=0; if (r>255) r=255;
+    if (g<0) g=0; if (g>255) g=255;
+    if (b<0) b=0; if (b>255) b=255;
+    return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+static void rgb_to_hsv(uint32_t color, int *oh, int *os, int *ov)
+{
+    int r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
+    int mx = r; if (g > mx) mx = g; if (b > mx) mx = b;
+    int mn = r; if (g < mn) mn = g; if (b < mn) mn = b;
+    int delta = mx - mn;
+    *ov = mx;
+    *os = (mx == 0) ? 0 : (delta * 255) / mx;
+    if (delta == 0) { *oh = 0; return; }
+    if (mx == r) { *oh = 60 * (g - b) / delta; if (*oh < 0) *oh += 360; }
+    else if (mx == g) { *oh = 120 + 60 * (b - r) / delta; }
+    else { *oh = 240 + 60 * (r - g) / delta; }
+}
+
+/* --- Layer compositing --- */
+static void artos_composite_layers(void)
+{
+    int npix = ARTOS_CANVAS_W * ARTOS_CANVAS_H;
+    for (int i = 0; i < npix; i++) art.composite[i] = 0xFFFFFFFF; /* white bg */
+    for (int l = 0; l < art.layer_count; l++) {
+        if (!art.layers[l].visible) continue;
+        uint8_t lop = art.layers[l].opacity;
+        for (int i = 0; i < npix; i++) {
+            uint32_t src = art.layers[l].pixels[i];
+            uint8_t sa = (src >> 24) & 0xFF;
+            int ea = (sa * lop) / 255;
+            if (ea >= 255) art.composite[i] = src | 0xFF000000;
+            else if (ea > 0) art.composite[i] = gfx_alpha_blend(src | 0xFF000000, art.composite[i], (uint8_t)ea);
+        }
+    }
+}
+
+/* --- Canvas access (operates on active layer) --- */
 static void artos_canvas_set(int cx, int cy, uint32_t color)
 {
     if (cx >= 0 && cx < ARTOS_CANVAS_W && cy >= 0 && cy < ARTOS_CANVAS_H)
-        art.canvas[cy * ARTOS_CANVAS_W + cx] = color;
+        art.layers[art.active_layer].pixels[cy * ARTOS_CANVAS_W + cx] = color;
+}
+
+static void artos_canvas_set_opacity(int cx, int cy, uint32_t color, int opacity)
+{
+    if (cx < 0 || cx >= ARTOS_CANVAS_W || cy < 0 || cy >= ARTOS_CANVAS_H) return;
+    if (opacity >= 255) {
+        art.layers[art.active_layer].pixels[cy * ARTOS_CANVAS_W + cx] = color;
+    } else if (opacity > 0) {
+        uint32_t ex = art.layers[art.active_layer].pixels[cy * ARTOS_CANVAS_W + cx];
+        art.layers[art.active_layer].pixels[cy * ARTOS_CANVAS_W + cx] =
+            gfx_alpha_blend(color, ex, (uint8_t)opacity);
+    }
 }
 
 static uint32_t artos_canvas_get(int cx, int cy)
 {
     if (cx >= 0 && cx < ARTOS_CANVAS_W && cy >= 0 && cy < ARTOS_CANVAS_H)
-        return art.canvas[cy * ARTOS_CANVAS_W + cx];
+        return art.layers[art.active_layer].pixels[cy * ARTOS_CANVAS_W + cx];
     return 0;
 }
 
-/* Push current canvas onto undo stack */
+/* --- Undo (operates on active layer only) --- */
 static void artos_undo_push(void)
 {
-    memcpy(art.undo[art.undo_pos], art.canvas,
+    memcpy(art.undo[art.undo_pos], art.layers[art.active_layer].pixels,
            sizeof(uint32_t) * ARTOS_CANVAS_W * ARTOS_CANVAS_H);
     art.undo_pos = (art.undo_pos + 1) % ARTOS_MAX_UNDO;
-    if (art.undo_count < ARTOS_MAX_UNDO)
-        art.undo_count++;
+    if (art.undo_count < ARTOS_MAX_UNDO) art.undo_count++;
 }
 
 static void artos_undo(void)
@@ -5787,17 +6000,42 @@ static void artos_undo(void)
     if (art.undo_count <= 0) return;
     art.undo_pos = (art.undo_pos - 1 + ARTOS_MAX_UNDO) % ARTOS_MAX_UNDO;
     art.undo_count--;
-    memcpy(art.canvas, art.undo[art.undo_pos],
+    memcpy(art.layers[art.active_layer].pixels, art.undo[art.undo_pos],
            sizeof(uint32_t) * ARTOS_CANVAS_W * ARTOS_CANVAS_H);
 }
 
-/* Draw a thick point on the canvas */
+static void artos_switch_layer(int n)
+{
+    if (n < 0 || n >= art.layer_count || n == art.active_layer) return;
+    art.active_layer = n;
+    art.undo_count = 0;
+    art.undo_pos = 0;
+}
+
+static void artos_flatten_layers(void)
+{
+    artos_composite_layers();
+    memcpy(art.layers[0].pixels, art.composite,
+           sizeof(uint32_t) * ARTOS_CANVAS_W * ARTOS_CANVAS_H);
+    art.layers[0].visible = 1;
+    art.layers[0].opacity = 255;
+    art.layer_count = 1;
+    art.active_layer = 0;
+    art.undo_count = 0;
+    art.undo_pos = 0;
+}
+
+/* --- Drawing primitives --- */
 static void artos_plot(int cx, int cy, uint32_t color, int size)
 {
     int r = size / 2;
     for (int dy = -r; dy <= r; dy++)
-        for (int dx = -r; dx <= r; dx++)
-            artos_canvas_set(cx + dx, cy + dy, color);
+        for (int dx = -r; dx <= r; dx++) {
+            if (art.brush_opacity >= 255)
+                artos_canvas_set(cx + dx, cy + dy, color);
+            else
+                artos_canvas_set_opacity(cx + dx, cy + dy, color, art.brush_opacity);
+        }
 }
 
 /* Bresenham line on canvas */
@@ -6351,14 +6589,39 @@ static void artos_init_state(void)
     art.fg_color = 0xFF000000;
     art.bg_color = 0xFFFFFFFF;
     art.brush_size = 1;
+    art.brush_opacity = 255;
+    art.zoom = 1;
     art.drawing = 0;
-    art.toolbar_h = 90;      /* Increased from 50 for AI + DrawNet rows */
-    art.palette_h = 40;
+    art.toolbar_h = ARTOS_TOOLBAR_H;
+    art.palette_h = ARTOS_PALETTE_H;
     art.modified = 0;
+    art.hsv_h = 0; art.hsv_s = 0; art.hsv_v = 0;
+    art.star_sides = 5;
+    art.grid_size = 8;
+    art.mirror_mode = 0;
+    art.grid_snap = 0;
+    art.bezier_count = 0;
+    art.clone_src_set = 0;
 
-    /* Fill canvas with white */
+    /* Init layer 0 */
+    art.layer_count = 1;
+    art.active_layer = 0;
+    art.layers[0].visible = 1;
+    art.layers[0].opacity = 255;
+    strcpy(art.layers[0].name, "Layer 1");
     for (int i = 0; i < ARTOS_CANVAS_W * ARTOS_CANVAS_H; i++)
-        art.canvas[i] = 0xFFFFFFFF;
+        art.layers[0].pixels[i] = 0xFFFFFFFF;
+
+    /* Pre-init other layers */
+    for (int l = 1; l < ARTOS_MAX_LAYERS; l++) {
+        art.layers[l].visible = 1;
+        art.layers[l].opacity = 255;
+        char nm[8]; nm[0] = 'L'; nm[1] = 'a'; nm[2] = 'y'; nm[3] = 'e';
+        nm[4] = 'r'; nm[5] = ' '; nm[6] = '1' + (char)l; nm[7] = '\0';
+        strcpy(art.layers[l].name, nm);
+    }
+
+    artos_composite_layers();
 }
 
 /* Convert content-area coords to canvas coords; returns 1 if on canvas */
@@ -6367,260 +6630,759 @@ static int artos_screen_to_canvas(int x, int y, int *cx, int *cy)
     if (art.pixel_scale <= 0) return 0;
     int rx = x - art.canvas_ox;
     int ry = y - art.canvas_oy;
-    *cx = rx / art.pixel_scale;
-    *cy = ry / art.pixel_scale;
+    *cx = rx / art.pixel_scale + art.scroll_x;
+    *cy = ry / art.pixel_scale + art.scroll_y;
     return (*cx >= 0 && *cx < ARTOS_CANVAS_W && *cy >= 0 && *cy < ARTOS_CANVAS_H);
 }
 
-/* Paint callback */
+/* --- New tool functions --- */
+
+/* Spray tool: scatter random dots in radius */
+static void artos_spray(int cx, int cy, uint32_t color, int radius)
+{
+    if (radius < 1) radius = 3;
+    int count = radius * 2;
+    for (int i = 0; i < count; i++) {
+        int dx = (int)(ai_rand() % (uint32_t)(2 * radius + 1)) - radius;
+        int dy = (int)(ai_rand() % (uint32_t)(2 * radius + 1)) - radius;
+        if (dx * dx + dy * dy <= radius * radius)
+            artos_canvas_set_opacity(cx + dx, cy + dy, color, art.brush_opacity);
+    }
+}
+
+/* Text tool: render one 8x16 font glyph onto canvas */
+extern const uint8_t font_data[95][16];
+static void artos_render_text_char(int cx, int cy, char ch, uint32_t color)
+{
+    if (ch < 32 || ch > 126) return;
+    const uint8_t *glyph = font_data[ch - 32];
+    for (int row = 0; row < 16 && (cy + row) < ARTOS_CANVAS_H; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < 8 && (cx + col) < ARTOS_CANVAS_W; col++) {
+            if (bits & (0x80 >> col))
+                artos_canvas_set(cx + col, cy + row, color);
+        }
+    }
+}
+
+/* Polygon tool: close and draw all edges */
+static void artos_close_polygon(void)
+{
+    if (art.poly_count < 2) { art.poly_count = 0; return; }
+    artos_undo_push();
+    for (int i = 0; i < art.poly_count - 1; i++)
+        artos_line(art.poly_verts[i][0], art.poly_verts[i][1],
+                   art.poly_verts[i+1][0], art.poly_verts[i+1][1],
+                   art.fg_color, art.brush_size);
+    artos_line(art.poly_verts[art.poly_count-1][0], art.poly_verts[art.poly_count-1][1],
+               art.poly_verts[0][0], art.poly_verts[0][1],
+               art.fg_color, art.brush_size);
+    art.poly_count = 0;
+    art.modified = 1;
+}
+
+/* --- New drawing tools (ArtOS v3) --- */
+
+/* Rounded rectangle: 4 quarter-circle arcs at corners + straight edges */
+static void artos_round_rect(int x0, int y0, int x1, int y1, uint32_t color, int r)
+{
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+    int w = x1 - x0, h = y1 - y0;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    if (r < 1) r = 1;
+    /* Straight edges */
+    artos_line(x0 + r, y0, x1 - r, y0, color, 1);
+    artos_line(x0 + r, y1, x1 - r, y1, color, 1);
+    artos_line(x0, y0 + r, x0, y1 - r, color, 1);
+    artos_line(x1, y0 + r, x1, y1 - r, color, 1);
+    /* Quarter arcs using midpoint circle algorithm */
+    int cx, cy, px = 0, py = r, d = 1 - r;
+    while (px <= py) {
+        /* Top-left arc */
+        cx = x0 + r; cy = y0 + r;
+        artos_canvas_set(cx - px, cy - py, color);
+        artos_canvas_set(cx - py, cy - px, color);
+        /* Top-right arc */
+        cx = x1 - r; cy = y0 + r;
+        artos_canvas_set(cx + px, cy - py, color);
+        artos_canvas_set(cx + py, cy - px, color);
+        /* Bottom-left arc */
+        cx = x0 + r; cy = y1 - r;
+        artos_canvas_set(cx - px, cy + py, color);
+        artos_canvas_set(cx - py, cy + px, color);
+        /* Bottom-right arc */
+        cx = x1 - r; cy = y1 - r;
+        artos_canvas_set(cx + px, cy + py, color);
+        artos_canvas_set(cx + py, cy + px, color);
+        px++;
+        if (d < 0) { d += 2 * px + 1; }
+        else { py--; d += 2 * (px - py) + 1; }
+    }
+}
+
+/* Star: regular star polygon with n outer and n inner vertices */
+static void artos_star(int cx, int cy, int radius, int sides, uint32_t color)
+{
+    if (sides < 3) sides = 3;
+    if (sides > 8) sides = 8;
+    if (radius < 2) return;
+    int inner = radius * 2 / 5; /* inner radius ~40% of outer */
+    int total = sides * 2;
+    int prevx = cx + (icos(270) * radius) / 1024;
+    int prevy = cy + (isin(270) * radius) / 1024;
+    for (int i = 1; i <= total; i++) {
+        int angle = 270 + (i * 360) / total;
+        int r = (i % 2 == 0) ? radius : inner;
+        int nx = cx + (icos(angle) * r) / 1024;
+        int ny = cy + (isin(angle) * r) / 1024;
+        artos_line(prevx, prevy, nx, ny, color, 1);
+        prevx = nx; prevy = ny;
+    }
+}
+
+/* Arrow: line with triangular arrowhead */
+static void artos_arrow(int x0, int y0, int x1, int y1, uint32_t color, int size)
+{
+    artos_line(x0, y0, x1, y1, color, size);
+    /* Arrowhead: triangle at endpoint */
+    int dx = x1 - x0, dy = y1 - y0;
+    int len = isqrt(dx * dx + dy * dy);
+    if (len < 1) return;
+    int head = 8 + size * 2;
+    /* Unit vector * 1024 scaled */
+    int ux = (dx * 1024) / len, uy = (dy * 1024) / len;
+    /* Perpendicular */
+    int px = -uy, py = ux;
+    /* Base of arrowhead */
+    int bx = x1 - (ux * head) / 1024;
+    int by = y1 - (uy * head) / 1024;
+    int hw = head / 2;
+    int ax = bx + (px * hw) / 1024, ay = by + (py * hw) / 1024;
+    int bx2 = bx - (px * hw) / 1024, by2 = by - (py * hw) / 1024;
+    artos_line(x1, y1, ax, ay, color, 1);
+    artos_line(x1, y1, bx2, by2, color, 1);
+    artos_line(ax, ay, bx2, by2, color, 1);
+}
+
+/* Cubic bezier via De Casteljau, 64 line segments, integer math */
+static void artos_bezier(int x0, int y0, int x1, int y1,
+                          int x2, int y2, int x3, int y3,
+                          uint32_t color, int size)
+{
+    int steps = 64;
+    int prevx = x0, prevy = y0;
+    for (int i = 1; i <= steps; i++) {
+        /* t = i/steps, use fixed-point t*1024 */
+        int t = (i * 1024) / steps;
+        int t1 = 1024 - t;
+        /* De Casteljau: B(t) = (1-t)^3*P0 + 3*(1-t)^2*t*P1 + 3*(1-t)*t^2*P2 + t^3*P3 */
+        /* Compute in stages to avoid overflow: max intermediate ~1024^3 = 1G, risky */
+        /* Use nested lerp instead for safety */
+        int ax = (t1 * x0 + t * x1) / 1024;
+        int ay = (t1 * y0 + t * y1) / 1024;
+        int bxx = (t1 * x1 + t * x2) / 1024;
+        int by = (t1 * y1 + t * y2) / 1024;
+        int cxx = (t1 * x2 + t * x3) / 1024;
+        int cy = (t1 * y2 + t * y3) / 1024;
+        int dx = (t1 * ax + t * bxx) / 1024;
+        int dy = (t1 * ay + t * by) / 1024;
+        int ex = (t1 * bxx + t * cxx) / 1024;
+        int ey = (t1 * by + t * cy) / 1024;
+        int fx = (t1 * dx + t * ex) / 1024;
+        int fy = (t1 * dy + t * ey) / 1024;
+        artos_line(prevx, prevy, fx, fy, color, size);
+        prevx = fx; prevy = fy;
+    }
+}
+
+/* Linear gradient fill: fills entire canvas with FG→BG gradient along the drag direction */
+static void artos_grad_fill(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    int len2 = dx * dx + dy * dy;
+    if (len2 < 1) len2 = 1;
+    uint8_t r0 = (art.fg_color >> 16) & 0xFF, g0 = (art.fg_color >> 8) & 0xFF, b0 = art.fg_color & 0xFF;
+    uint8_t r1 = (art.bg_color >> 16) & 0xFF, g1 = (art.bg_color >> 8) & 0xFF, b1 = art.bg_color & 0xFF;
+    for (int py = 0; py < ARTOS_CANVAS_H; py++) {
+        for (int px = 0; px < ARTOS_CANVAS_W; px++) {
+            /* Project (px-x0, py-y0) onto (dx, dy), get t in 0..256 */
+            int dot = (px - x0) * dx + (py - y0) * dy;
+            int t = (dot * 256) / len2;
+            if (t < 0) t = 0; if (t > 256) t = 256;
+            int r = r0 + ((r1 - r0) * t) / 256;
+            int g = g0 + ((g1 - g0) * t) / 256;
+            int b = b0 + ((b1 - b0) * t) / 256;
+            artos_canvas_set(px, py, 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+        }
+    }
+}
+
+/* Dither flood fill: like flood_fill but uses 2x2 ordered dither of FG+BG */
+static void artos_dither_fill(int sx, int sy)
+{
+    uint32_t target = artos_canvas_get(sx, sy);
+    if (target == art.fg_color || target == art.bg_color) return;
+    /* Simple iterative flood fill with dither */
+    static int stack_x2[4096], stack_y2[4096];
+    int sp = 0;
+    stack_x2[sp] = sx; stack_y2[sp] = sy; sp++;
+    while (sp > 0) {
+        sp--;
+        int cx = stack_x2[sp], cy = stack_y2[sp];
+        if (cx < 0 || cx >= ARTOS_CANVAS_W || cy < 0 || cy >= ARTOS_CANVAS_H) continue;
+        if (artos_canvas_get(cx, cy) != target) continue;
+        /* 2x2 ordered dither: (0,0)=FG, (1,0)=BG, (0,1)=BG, (1,1)=FG */
+        uint32_t dc = ((cx + cy) % 2 == 0) ? art.fg_color : art.bg_color;
+        artos_canvas_set(cx, cy, dc);
+        if (sp < 4092) {
+            stack_x2[sp] = cx + 1; stack_y2[sp] = cy; sp++;
+            stack_x2[sp] = cx - 1; stack_y2[sp] = cy; sp++;
+            stack_x2[sp] = cx; stack_y2[sp] = cy + 1; sp++;
+            stack_x2[sp] = cx; stack_y2[sp] = cy - 1; sp++;
+        }
+    }
+}
+
+/* Calligraphy: angled rectangular nib at 45 degrees */
+static void artos_callig_plot(int cx, int cy, uint32_t color, int size)
+{
+    /* Draw a diagonal line from (cx-size/2, cy+size/2) to (cx+size/2, cy-size/2) */
+    int half = size / 2;
+    for (int i = -half; i <= half; i++)
+        artos_canvas_set(cx + i, cy - i, color);
+}
+
+static void artos_callig_line(int x0, int y0, int x1, int y1, uint32_t color, int size)
+{
+    /* Bresenham between points, applying callig_plot at each step */
+    int dx = x1 - x0, dy = y1 - y0;
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    int sx = (dx > 0) ? 1 : -1, sy = (dy > 0) ? 1 : -1;
+    int err = adx - ady, cx = x0, cy = y0;
+    while (1) {
+        artos_callig_plot(cx, cy, color, size);
+        if (cx == x1 && cy == y1) break;
+        int e2 = err * 2;
+        if (e2 > -ady) { err -= ady; cx += sx; }
+        if (e2 < adx) { err += adx; cy += sy; }
+    }
+}
+
+/* Soft brush: circle with opacity falloff from center */
+static void artos_soft_plot(int cx, int cy, uint32_t color, int size)
+{
+    int r = size;
+    if (r < 1) r = 1;
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            int d2 = dx * dx + dy * dy;
+            if (d2 > r * r) continue;
+            /* Opacity falloff: 255 at center, 0 at edge */
+            int dist = isqrt(d2);
+            int alpha = 255 - (dist * 255) / r;
+            if (alpha < 0) alpha = 0;
+            /* Apply brush_opacity scaling */
+            alpha = (alpha * art.brush_opacity) / 255;
+            artos_canvas_set_opacity(cx + dx, cy + dy, color, alpha);
+        }
+    }
+}
+
+/* Pattern brush: 4x4 checkerboard of FG and BG */
+static void artos_pattern_plot(int cx, int cy, int size)
+{
+    int r = size / 2;
+    if (r < 1) r = 1;
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy > r * r) continue;
+            /* 4x4 checkerboard pattern */
+            int px = cx + dx, py = cy + dy;
+            uint32_t color = (((px / 4) + (py / 4)) % 2 == 0) ? art.fg_color : art.bg_color;
+            artos_canvas_set(px, py, color);
+        }
+    }
+}
+
+/* Clone stamp: paint pixels from source offset */
+static void artos_clone_plot(int cx, int cy, int size)
+{
+    int r = size / 2;
+    if (r < 1) r = 1;
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy > r * r) continue;
+            int sx = cx + dx + art.clone_off_x;
+            int sy = cy + dy + art.clone_off_y;
+            if (sx >= 0 && sx < ARTOS_CANVAS_W && sy >= 0 && sy < ARTOS_CANVAS_H) {
+                uint32_t src = artos_canvas_get(sx, sy);
+                artos_canvas_set(cx + dx, cy + dy, src);
+            }
+        }
+    }
+}
+
+/* Smudge: pick up pixel buffer at click point */
+static void artos_smudge_pickup(int cx, int cy, int size)
+{
+    int r = size / 2;
+    if (r < 1) r = 1;
+    int diam = r * 2 + 1;
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            int idx = (dy + r) * diam + (dx + r);
+            if (idx < 441)
+                art.smudge_buf[idx] = artos_canvas_get(cx + dx, cy + dy);
+        }
+    }
+}
+
+/* Smudge: blend buffer with destination pixels */
+static void artos_smudge_apply(int cx, int cy, int size)
+{
+    int r = size / 2;
+    if (r < 1) r = 1;
+    int diam = r * 2 + 1;
+    int strength = 160; /* ~62% carry-forward */
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy > r * r) continue;
+            int idx = (dy + r) * diam + (dx + r);
+            if (idx >= 441) continue;
+            uint32_t dst = artos_canvas_get(cx + dx, cy + dy);
+            uint32_t src = art.smudge_buf[idx];
+            uint32_t blended = gfx_alpha_blend(src, dst, (uint8_t)strength);
+            artos_canvas_set(cx + dx, cy + dy, blended);
+            art.smudge_buf[idx] = blended;
+        }
+    }
+}
+
+/* --- Edit operations --- */
+
+static void artos_flip_h(void)
+{
+    artos_undo_push();
+    uint32_t *px = art.layers[art.active_layer].pixels;
+    int x0 = 0, y0 = 0, x1 = ARTOS_CANVAS_W, y1 = ARTOS_CANVAS_H;
+    if (art.sel_active) { x0 = art.sel_x1; y0 = art.sel_y1; x1 = art.sel_x2; y1 = art.sel_y2; }
+    int w = x1 - x0;
+    for (int y = y0; y < y1; y++)
+        for (int i = 0; i < w / 2; i++) {
+            int a = y * ARTOS_CANVAS_W + x0 + i;
+            int b = y * ARTOS_CANVAS_W + x1 - 1 - i;
+            uint32_t tmp = px[a]; px[a] = px[b]; px[b] = tmp;
+        }
+}
+
+static void artos_flip_v(void)
+{
+    artos_undo_push();
+    uint32_t *px = art.layers[art.active_layer].pixels;
+    int x0 = 0, y0 = 0, x1 = ARTOS_CANVAS_W, y1 = ARTOS_CANVAS_H;
+    if (art.sel_active) { x0 = art.sel_x1; y0 = art.sel_y1; x1 = art.sel_x2; y1 = art.sel_y2; }
+    int h = y1 - y0;
+    for (int i = 0; i < h / 2; i++)
+        for (int x = x0; x < x1; x++) {
+            int a = (y0 + i) * ARTOS_CANVAS_W + x;
+            int b = (y1 - 1 - i) * ARTOS_CANVAS_W + x;
+            uint32_t tmp = px[a]; px[a] = px[b]; px[b] = tmp;
+        }
+}
+
+static void artos_invert(void)
+{
+    artos_undo_push();
+    uint32_t *px = art.layers[art.active_layer].pixels;
+    int x0 = 0, y0 = 0, x1 = ARTOS_CANVAS_W, y1 = ARTOS_CANVAS_H;
+    if (art.sel_active) { x0 = art.sel_x1; y0 = art.sel_y1; x1 = art.sel_x2; y1 = art.sel_y2; }
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++)
+            px[y * ARTOS_CANVAS_W + x] ^= 0x00FFFFFF;
+}
+
+static void artos_brightness(int delta)
+{
+    artos_undo_push();
+    uint32_t *px = art.layers[art.active_layer].pixels;
+    int x0 = 0, y0 = 0, x1 = ARTOS_CANVAS_W, y1 = ARTOS_CANVAS_H;
+    if (art.sel_active) { x0 = art.sel_x1; y0 = art.sel_y1; x1 = art.sel_x2; y1 = art.sel_y2; }
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            int idx = y * ARTOS_CANVAS_W + x;
+            uint32_t c = px[idx];
+            int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+            r += delta; if (r < 0) r = 0; if (r > 255) r = 255;
+            g += delta; if (g < 0) g = 0; if (g > 255) g = 255;
+            b += delta; if (b < 0) b = 0; if (b > 255) b = 255;
+            px[idx] = (c & 0xFF000000) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+}
+
+static void artos_posterize(void)
+{
+    artos_undo_push();
+    uint32_t *px = art.layers[art.active_layer].pixels;
+    int x0 = 0, y0 = 0, x1 = ARTOS_CANVAS_W, y1 = ARTOS_CANVAS_H;
+    if (art.sel_active) { x0 = art.sel_x1; y0 = art.sel_y1; x1 = art.sel_x2; y1 = art.sel_y2; }
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            int idx = y * ARTOS_CANVAS_W + x;
+            uint32_t c = px[idx];
+            int r = ((c >> 16) & 0xFF) / 85 * 85;
+            int g = ((c >> 8) & 0xFF) / 85 * 85;
+            int b = (c & 0xFF) / 85 * 85;
+            px[idx] = (c & 0xFF000000) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+}
+
+/* Paint callback — ArtOS v3 */
 static void artos_paint(struct wm_window *win)
 {
     int cw = wm_content_width(win);
     int ch = wm_content_height(win);
     int ox = win->x;
     int oy = win->y + WM_TITLE_HEIGHT;
+    uint32_t tb_bg = 0xFF111827;
 
-    /* === Toolbar (top area) === */
-    fb_fill_rect((uint32_t)ox, (uint32_t)oy,
-                 (uint32_t)cw, (uint32_t)art.toolbar_h, 0xFF111827);
+    /* Composite layers for display */
+    artos_composite_layers();
 
-    /* Tool buttons: 8 tools in a row */
-    int btn_w = 48, btn_h = 18, btn_y = 2, btn_x = 4;
-    for (int i = 0; i < ARTOS_TOOL_COUNT; i++) {
+    /* === TOOLBAR (7 rows, 132px) === */
+    fb_fill_rect((uint32_t)ox, (uint32_t)oy, (uint32_t)cw, (uint32_t)ARTOS_TOOLBAR_H, tb_bg);
+
+    /* Row A (y=2): tools 0-5 */
+    for (int i = 0; i < 6; i++) {
         uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
-        fb_fill_rect((uint32_t)(ox + btn_x), (uint32_t)(oy + btn_y),
-                     (uint32_t)btn_w, (uint32_t)btn_h, bg);
-        /* Tool name */
-        font_draw_string((uint32_t)(ox + btn_x + 4), (uint32_t)(oy + btn_y + 3),
-                         artos_tool_names[i], COLOR_WHITE, bg);
-        btn_x += btn_w + 2;
+        int bx = 4 + i * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 2), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
+        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 5), artos_tool_names[i], COLOR_WHITE, bg);
+    }
+    /* Row B (y=22): tools 6-11 */
+    for (int i = 6; i < 12; i++) {
+        uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
+        int bx = 4 + (i - 6) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 22), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
+        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 25), artos_tool_names[i], COLOR_WHITE, bg);
+    }
+    /* Row C (y=42): tools 12-17 */
+    for (int i = 12; i < 18; i++) {
+        uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
+        int bx = 4 + (i - 12) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 42), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
+        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 45), artos_tool_names[i], COLOR_WHITE, bg);
+    }
+    /* Row D (y=62): tools 18-23 */
+    for (int i = 18; i < ARTOS_TOOL_COUNT; i++) {
+        uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
+        int bx = 4 + (i - 18) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 62), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
+        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 65), artos_tool_names[i], COLOR_WHITE, bg);
     }
 
-    /* Second row: Undo, Clear, Brush size, FG/BG color swatches */
-    int row2_y = btn_y + btn_h + 4;
+    /* Row E (y=82): Undo Clear | Size | Opac | FG BG Swap | Zoom | Mir Grd */
+    int ry = 82;
+    fb_fill_rect((uint32_t)(ox + 4), (uint32_t)(oy + ry), 36, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_string((uint32_t)(ox + 6), (uint32_t)(oy + ry + 3), "Undo", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    fb_fill_rect((uint32_t)(ox + 44), (uint32_t)(oy + ry), 36, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_string((uint32_t)(ox + 46), (uint32_t)(oy + ry + 3), "Clr", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
 
-    /* Undo button */
-    fb_fill_rect((uint32_t)(ox + 4), (uint32_t)(oy + row2_y),
-                 40, 18, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 8), (uint32_t)(oy + row2_y + 3),
-                     "Undo", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    /* Size -[n]+ */
+    font_draw_string((uint32_t)(ox + 86), (uint32_t)(oy + ry + 3), "Sz", COLOR_TEXT_DIM, tb_bg);
+    fb_fill_rect((uint32_t)(ox + 104), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_char((uint32_t)(ox + 108), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    { char sc[4]; sc[0] = '0' + (char)(art.brush_size % 10);
+      if (art.brush_size >= 10) { sc[0] = '1'; sc[1] = '0'; sc[2] = '\0'; }
+      else { sc[1] = '\0'; }
+      font_draw_string((uint32_t)(ox + 122), (uint32_t)(oy + ry + 3), sc, COLOR_TEXT, tb_bg); }
+    fb_fill_rect((uint32_t)(ox + 136), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_char((uint32_t)(ox + 140), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
 
-    /* Clear button */
-    fb_fill_rect((uint32_t)(ox + 48), (uint32_t)(oy + row2_y),
-                 44, 18, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 52), (uint32_t)(oy + row2_y + 3),
-                     "Clear", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    /* Opacity -[n]+ */
+    font_draw_string((uint32_t)(ox + 158), (uint32_t)(oy + ry + 3), "Op", COLOR_TEXT_DIM, tb_bg);
+    fb_fill_rect((uint32_t)(ox + 176), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_char((uint32_t)(ox + 180), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    { char ob[4]; int ov = (art.brush_opacity * 100) / 255;
+      ob[0] = '0' + (char)(ov / 10); ob[1] = '0' + (char)(ov % 10); ob[2] = '\0';
+      font_draw_string((uint32_t)(ox + 194), (uint32_t)(oy + ry + 3), ob, COLOR_TEXT, tb_bg); }
+    fb_fill_rect((uint32_t)(ox + 212), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_char((uint32_t)(ox + 216), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
 
-    /* Brush size label + value */
-    font_draw_string((uint32_t)(ox + 100), (uint32_t)(oy + row2_y + 3),
-                     "Size:", COLOR_TEXT_DIM, 0xFF111827);
+    /* FG/BG swatches */
+    fb_fill_rect((uint32_t)(ox + 236), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, art.fg_color);
+    fb_draw_rect((uint32_t)(ox + 236), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, COLOR_TEXT_DIM);
+    fb_fill_rect((uint32_t)(ox + 258), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, art.bg_color);
+    fb_draw_rect((uint32_t)(ox + 258), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, COLOR_TEXT_DIM);
+    fb_fill_rect((uint32_t)(ox + 280), (uint32_t)(oy + ry), 28, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_string((uint32_t)(ox + 282), (uint32_t)(oy + ry + 3), "Swp", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
 
-    /* Size buttons: - and + */
-    fb_fill_rect((uint32_t)(ox + 144), (uint32_t)(oy + row2_y),
-                 18, 18, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 149), (uint32_t)(oy + row2_y + 3),
-                   '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    /* Zoom -[n]+ */
+    font_draw_string((uint32_t)(ox + 316), (uint32_t)(oy + ry + 3), "Zm", COLOR_TEXT_DIM, tb_bg);
+    fb_fill_rect((uint32_t)(ox + 334), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_char((uint32_t)(ox + 338), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    { char zc = '0' + (char)art.zoom;
+      font_draw_char((uint32_t)(ox + 354), (uint32_t)(oy + ry + 3), zc, COLOR_TEXT, tb_bg); }
+    fb_fill_rect((uint32_t)(ox + 364), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_char((uint32_t)(ox + 368), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
 
-    /* Size number */
-    char sz_ch = '0' + (char)art.brush_size;
-    font_draw_char((uint32_t)(ox + 166), (uint32_t)(oy + row2_y + 3),
-                   sz_ch, COLOR_TEXT, 0xFF111827);
+    /* Mirror mode toggle */
+    { uint32_t mir_bg = art.mirror_mode ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
+      fb_fill_rect((uint32_t)(ox + 388), (uint32_t)(oy + ry), 28, ARTOS_BTN_H, mir_bg);
+      font_draw_string((uint32_t)(ox + 390), (uint32_t)(oy + ry + 3), "Mir", COLOR_WHITE, mir_bg); }
+    /* Grid snap toggle */
+    { uint32_t grd_bg = art.grid_snap ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
+      fb_fill_rect((uint32_t)(ox + 420), (uint32_t)(oy + ry), 28, ARTOS_BTN_H, grd_bg);
+      font_draw_string((uint32_t)(ox + 422), (uint32_t)(oy + ry + 3), "Grd", COLOR_WHITE, grd_bg); }
 
-    fb_fill_rect((uint32_t)(ox + 178), (uint32_t)(oy + row2_y),
-                 18, 18, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 183), (uint32_t)(oy + row2_y + 3),
-                   '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    /* Row F (y=102): AI prompt */
+    int ai_y = 102;
+    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + ai_y + 3), "AI:", COLOR_TEXT_DIM, tb_bg);
+    uint32_t pbg = art.ai_input_active ? 0xFF1F2937 : 0xFF0F1419;
+    fb_fill_rect((uint32_t)(ox + 26), (uint32_t)(oy + ai_y), 280, ARTOS_BTN_H, pbg);
+    fb_draw_rect((uint32_t)(ox + 26), (uint32_t)(oy + ai_y), 280, ARTOS_BTN_H, COLOR_TEXT_DIM);
+    if (art.ai_prompt[0])
+        font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + ai_y + 3), art.ai_prompt, COLOR_TEXT, pbg);
+    else
+        font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + ai_y + 3), "(prompt...)", COLOR_TEXT_DIM, pbg);
+    if (art.ai_input_active)
+        gfx_draw_vline(ox + 30 + art.ai_prompt_cursor * 8, oy + ai_y + 2, 14, COLOR_HIGHLIGHT);
+    fb_fill_rect((uint32_t)(ox + 312), (uint32_t)(oy + ai_y), 56, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
+    font_draw_string((uint32_t)(ox + 314), (uint32_t)(oy + ai_y + 3), "Gen", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
 
-    /* FG color swatch */
-    font_draw_string((uint32_t)(ox + 210), (uint32_t)(oy + row2_y + 3),
-                     "FG:", COLOR_TEXT_DIM, 0xFF111827);
-    fb_fill_rect((uint32_t)(ox + 236), (uint32_t)(oy + row2_y),
-                 20, 18, art.fg_color);
-    fb_draw_rect((uint32_t)(ox + 236), (uint32_t)(oy + row2_y),
-                 20, 18, COLOR_TEXT_DIM);
-
-    /* BG color swatch */
-    font_draw_string((uint32_t)(ox + 264), (uint32_t)(oy + row2_y + 3),
-                     "BG:", COLOR_TEXT_DIM, 0xFF111827);
-    fb_fill_rect((uint32_t)(ox + 290), (uint32_t)(oy + row2_y),
-                 20, 18, art.bg_color);
-    fb_draw_rect((uint32_t)(ox + 290), (uint32_t)(oy + row2_y),
-                 20, 18, COLOR_TEXT_DIM);
-
-    /* Swap button */
-    fb_fill_rect((uint32_t)(ox + 316), (uint32_t)(oy + row2_y),
-                 32, 18, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 318), (uint32_t)(oy + row2_y + 3),
-                     "Swap", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
-    /* Third row: AI Art Generator */
-    int row3_y = row2_y + 22;
-
-    /* AI Prompt field */
-    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + row3_y + 3),
-                     "AI:", COLOR_TEXT_DIM, 0xFF111827);
-
-    /* Prompt input box (280px wide) */
-    uint32_t prompt_bg = art.ai_input_active ? 0xFF1F2937 : 0xFF0F1419;
-    fb_fill_rect((uint32_t)(ox + 26), (uint32_t)(oy + row3_y),
-                 280, 18, prompt_bg);
-    fb_draw_rect((uint32_t)(ox + 26), (uint32_t)(oy + row3_y),
-                 280, 18, COLOR_TEXT_DIM);
-
-    /* Draw prompt text */
-    if (art.ai_prompt[0]) {
-        font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + row3_y + 3),
-                         art.ai_prompt, COLOR_TEXT, prompt_bg);
-    } else {
-        font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + row3_y + 3),
-                         "(type a prompt...)", COLOR_TEXT_DIM, prompt_bg);
-    }
-
-    /* Cursor if active */
-    if (art.ai_input_active) {
-        int cursor_x = 30 + art.ai_prompt_cursor * 8;
-        gfx_draw_vline(ox + cursor_x, oy + row3_y + 2, 14, COLOR_HIGHLIGHT);
-    }
-
-    /* Generate button */
-    fb_fill_rect((uint32_t)(ox + 312), (uint32_t)(oy + row3_y),
-                 60, 18, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 314), (uint32_t)(oy + row3_y + 3),
-                     "Generate", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
-    /* Fourth row: DrawNet Collaboration */
-    int row4_y = row3_y + 22;
-
-    /* DrawNet label */
-    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + row4_y + 3),
-                     "Net:", COLOR_TEXT_DIM, 0xFF111827);
-
-    /* Session ID input box */
-    uint32_t session_bg = art.drawnet_input_active ? 0xFF1F2937 : 0xFF0F1419;
-    fb_fill_rect((uint32_t)(ox + 32), (uint32_t)(oy + row4_y),
-                 80, 18, session_bg);
-    fb_draw_rect((uint32_t)(ox + 32), (uint32_t)(oy + row4_y),
-                 80, 18, COLOR_TEXT_DIM);
-
-    /* Draw session ID */
-    if (art.drawnet_input[0]) {
-        font_draw_string((uint32_t)(ox + 36), (uint32_t)(oy + row4_y + 3),
-                         art.drawnet_input, COLOR_TEXT, session_bg);
-    } else {
-        font_draw_string((uint32_t)(ox + 36), (uint32_t)(oy + row4_y + 3),
-                         "(session)", COLOR_TEXT_DIM, session_bg);
-    }
-
-    /* Cursor if active */
-    if (art.drawnet_input_active) {
-        int cursor_x = 36 + (int)strlen(art.drawnet_input) * 8;
-        gfx_draw_vline(ox + cursor_x, oy + row4_y + 2, 14, COLOR_HIGHLIGHT);
-    }
-
-    /* Start/Stop button */
+    /* Row G (y=120): DrawNet */
+    int dn_y = 120;
+    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + dn_y + 3), "Net:", COLOR_TEXT_DIM, tb_bg);
+    uint32_t sbg = art.drawnet_input_active ? 0xFF1F2937 : 0xFF0F1419;
+    fb_fill_rect((uint32_t)(ox + 32), (uint32_t)(oy + dn_y), 80, ARTOS_BTN_H, sbg);
+    fb_draw_rect((uint32_t)(ox + 32), (uint32_t)(oy + dn_y), 80, ARTOS_BTN_H, COLOR_TEXT_DIM);
+    if (art.drawnet_input[0])
+        font_draw_string((uint32_t)(ox + 36), (uint32_t)(oy + dn_y + 3), art.drawnet_input, COLOR_TEXT, sbg);
+    if (art.drawnet_input_active)
+        gfx_draw_vline(ox + 36 + (int)strlen(art.drawnet_input) * 8, oy + dn_y + 2, 14, COLOR_HIGHLIGHT);
     if (art.drawnet_enabled) {
-        fb_fill_rect((uint32_t)(ox + 118), (uint32_t)(oy + row4_y),
-                     40, 18, COLOR_HIGHLIGHT);
-        font_draw_string((uint32_t)(ox + 122), (uint32_t)(oy + row4_y + 3),
-                         "Stop", COLOR_WHITE, COLOR_HIGHLIGHT);
+        fb_fill_rect((uint32_t)(ox + 118), (uint32_t)(oy + dn_y), 36, ARTOS_BTN_H, COLOR_HIGHLIGHT);
+        font_draw_string((uint32_t)(ox + 120), (uint32_t)(oy + dn_y + 3), "Stop", COLOR_WHITE, COLOR_HIGHLIGHT);
     } else {
-        fb_fill_rect((uint32_t)(ox + 118), (uint32_t)(oy + row4_y),
-                     40, 18, COLOR_GREEN_ACTIVE);
-        font_draw_string((uint32_t)(ox + 120), (uint32_t)(oy + row4_y + 3),
-                         "Start", COLOR_WHITE, COLOR_GREEN_ACTIVE);
+        fb_fill_rect((uint32_t)(ox + 118), (uint32_t)(oy + dn_y), 36, ARTOS_BTN_H, COLOR_GREEN_ACTIVE);
+        font_draw_string((uint32_t)(ox + 120), (uint32_t)(oy + dn_y + 3), "Go", COLOR_WHITE, COLOR_GREEN_ACTIVE);
     }
 
-    /* Peer count display */
-    if (art.drawnet_enabled) {
-        char peer_str[32];
-        dn_int_to_str(art.drawnet_peer_count, peer_str);
-        dn_strcat(peer_str, " peers");
-        font_draw_string((uint32_t)(ox + 164), (uint32_t)(oy + row4_y + 3),
-                         peer_str, COLOR_TEXT, 0xFF111827);
+    /* Separator */
+    gfx_draw_hline(ox, oy + ARTOS_TOOLBAR_H - 1, cw, COLOR_PANEL_BORDER);
+
+    /* === CANVAS AREA + LAYER PANEL === */
+    int ca_y = ARTOS_TOOLBAR_H;
+    int ca_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
+    int cp_w = cw - ARTOS_LAYER_PANEL_W; /* canvas panel width */
+
+    /* Canvas dark bg */
+    fb_fill_rect((uint32_t)ox, (uint32_t)(oy + ca_y), (uint32_t)cp_w, (uint32_t)ca_h, 0xFF202030);
+
+    /* Layer panel bg */
+    fb_fill_rect((uint32_t)(ox + cp_w), (uint32_t)(oy + ca_y),
+                 (uint32_t)ARTOS_LAYER_PANEL_W, (uint32_t)ca_h, 0xFF0F1218);
+    gfx_draw_vline(ox + cp_w, oy + ca_y, ca_h, COLOR_PANEL_BORDER);
+
+    /* Layer panel content */
+    font_draw_string((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + ca_y + 4), "Layers", COLOR_TEXT_DIM, 0xFF0F1218);
+    for (int l = 0; l < art.layer_count; l++) {
+        int ly = ca_y + 22 + l * 24;
+        uint32_t lbg = (l == art.active_layer) ? 0xFF1E3A5F : 0xFF0F1218;
+        fb_fill_rect((uint32_t)(ox + cp_w + 2), (uint32_t)(oy + ly), (uint32_t)(ARTOS_LAYER_PANEL_W - 4), 22, lbg);
+        /* Eye icon (visibility) */
+        uint32_t ec = art.layers[l].visible ? COLOR_GREEN_ACTIVE : COLOR_TEXT_DIM;
+        fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + ly + 6), 8, 8, ec);
+        /* Layer name */
+        font_draw_string((uint32_t)(ox + cp_w + 16), (uint32_t)(oy + ly + 5),
+                         art.layers[l].name, COLOR_TEXT, lbg);
     }
 
-    /* Toolbar separator */
-    gfx_draw_hline(ox, oy + art.toolbar_h - 1, cw, COLOR_PANEL_BORDER);
+    /* Add layer button */
+    if (art.layer_count < ARTOS_MAX_LAYERS) {
+        int aby = ca_y + 22 + art.layer_count * 24 + 4;
+        fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + aby), 52, 16, COLOR_BUTTON_PRIMARY);
+        font_draw_string((uint32_t)(ox + cp_w + 8), (uint32_t)(oy + aby + 2), "+Layer", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    }
 
-    /* === Canvas Area (center) === */
-    int canvas_area_y = art.toolbar_h;
-    int canvas_area_h = ch - art.toolbar_h - art.palette_h;
+    /* Flatten button */
+    if (art.layer_count > 1) {
+        int fby = ca_y + 22 + ARTOS_MAX_LAYERS * 24 + 8;
+        fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + fby), 52, 16, COLOR_BUTTON_PRIMARY);
+        font_draw_string((uint32_t)(ox + cp_w + 6), (uint32_t)(oy + fby + 2), "Flatten", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    }
 
-    /* Dark background for canvas area */
-    fb_fill_rect((uint32_t)ox, (uint32_t)(oy + canvas_area_y),
-                 (uint32_t)cw, (uint32_t)canvas_area_h, 0xFF202030);
+    /* Layer opacity */
+    { int loy = ca_y + ca_h - 40;
+      font_draw_string((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + loy), "Opac", COLOR_TEXT_DIM, 0xFF0F1218);
+      fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + loy + 14), 16, 14, COLOR_BUTTON_PRIMARY);
+      font_draw_char((uint32_t)(ox + cp_w + 8), (uint32_t)(oy + loy + 16), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+      fb_fill_rect((uint32_t)(ox + cp_w + 40), (uint32_t)(oy + loy + 14), 16, 14, COLOR_BUTTON_PRIMARY);
+      font_draw_char((uint32_t)(ox + cp_w + 44), (uint32_t)(oy + loy + 16), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+      char lop[4]; int lov = (art.layers[art.active_layer].opacity * 100) / 255;
+      lop[0] = '0' + (char)(lov / 10); lop[1] = '0' + (char)(lov % 10); lop[2] = '\0';
+      font_draw_string((uint32_t)(ox + cp_w + 22), (uint32_t)(oy + loy + 16), lop, COLOR_TEXT, 0xFF0F1218);
+    }
 
-    /* Calculate pixel scale to fit canvas in available area with some margin */
-    int margin = 8;
-    int avail_w = cw - margin * 2;
-    int avail_h = canvas_area_h - margin * 2;
-    int scale_w = avail_w / ARTOS_CANVAS_W;
-    int scale_h = avail_h / ARTOS_CANVAS_H;
-    art.pixel_scale = scale_w < scale_h ? scale_w : scale_h;
-    if (art.pixel_scale < 1) art.pixel_scale = 1;
+    /* Calculate zoom/pan for canvas rendering */
+    int avail_w = cp_w - ARTOS_MARGIN * 2;
+    int avail_h = ca_h - ARTOS_MARGIN * 2;
+    art.pixel_scale = art.zoom;
 
-    int display_w = ARTOS_CANVAS_W * art.pixel_scale;
-    int display_h = ARTOS_CANVAS_H * art.pixel_scale;
-    art.canvas_ox = (cw - display_w) / 2;
-    art.canvas_oy = canvas_area_y + (canvas_area_h - display_h) / 2;
+    int vp_cw = avail_w / art.pixel_scale;
+    int vp_ch = avail_h / art.pixel_scale;
+    if (vp_cw > ARTOS_CANVAS_W) vp_cw = ARTOS_CANVAS_W;
+    if (vp_ch > ARTOS_CANVAS_H) vp_ch = ARTOS_CANVAS_H;
 
-    /* Draw canvas pixels (scaled up) */
-    for (int cy = 0; cy < ARTOS_CANVAS_H; cy++) {
-        for (int cx = 0; cx < ARTOS_CANVAS_W; cx++) {
-            uint32_t color = art.canvas[cy * ARTOS_CANVAS_W + cx];
-            int sx = ox + art.canvas_ox + cx * art.pixel_scale;
-            int sy = oy + art.canvas_oy + cy * art.pixel_scale;
+    /* Clamp scroll */
+    int msx = ARTOS_CANVAS_W - vp_cw; if (msx < 0) msx = 0;
+    int msy = ARTOS_CANVAS_H - vp_ch; if (msy < 0) msy = 0;
+    if (art.scroll_x > msx) art.scroll_x = msx;
+    if (art.scroll_y > msy) art.scroll_y = msy;
+    if (art.scroll_x < 0) art.scroll_x = 0;
+    if (art.scroll_y < 0) art.scroll_y = 0;
+
+    int disp_w = vp_cw * art.pixel_scale;
+    int disp_h = vp_ch * art.pixel_scale;
+    int off_x = (disp_w <= avail_w) ? (avail_w - disp_w) / 2 : 0;
+    int off_y = (disp_h <= avail_h) ? (avail_h - disp_h) / 2 : 0;
+    art.canvas_ox = ARTOS_MARGIN + off_x;
+    art.canvas_oy = ca_y + ARTOS_MARGIN + off_y;
+
+    /* Draw composite canvas (zoomed + scrolled) */
+    for (int vy = 0; vy < vp_ch; vy++) {
+        for (int vx = 0; vx < vp_cw; vx++) {
+            int ccx = art.scroll_x + vx;
+            int ccy = art.scroll_y + vy;
+            uint32_t color = art.composite[ccy * ARTOS_CANVAS_W + ccx];
+            int sx = ox + art.canvas_ox + vx * art.pixel_scale;
+            int sy = oy + art.canvas_oy + vy * art.pixel_scale;
             fb_fill_rect((uint32_t)sx, (uint32_t)sy,
-                         (uint32_t)art.pixel_scale, (uint32_t)art.pixel_scale,
-                         color);
+                         (uint32_t)art.pixel_scale, (uint32_t)art.pixel_scale, color);
         }
     }
 
     /* Canvas border */
-    fb_draw_rect((uint32_t)(ox + art.canvas_ox - 1),
-                 (uint32_t)(oy + art.canvas_oy - 1),
-                 (uint32_t)(display_w + 2), (uint32_t)(display_h + 2),
-                 COLOR_TEXT_DIM);
+    fb_draw_rect((uint32_t)(ox + art.canvas_ox - 1), (uint32_t)(oy + art.canvas_oy - 1),
+                 (uint32_t)(disp_w + 2), (uint32_t)(disp_h + 2), COLOR_TEXT_DIM);
 
-    /* === Color Palette (bottom) === */
-    int pal_y = ch - art.palette_h;
-    fb_fill_rect((uint32_t)ox, (uint32_t)(oy + pal_y),
-                 (uint32_t)cw, (uint32_t)art.palette_h, 0xFF111827);
+    /* Selection overlay (dashed rect) */
+    if (art.sel_active) {
+        int sx1 = (art.sel_x1 - art.scroll_x) * art.pixel_scale + art.canvas_ox;
+        int sy1 = (art.sel_y1 - art.scroll_y) * art.pixel_scale + art.canvas_oy;
+        int sx2 = (art.sel_x2 - art.scroll_x) * art.pixel_scale + art.canvas_ox;
+        int sy2 = (art.sel_y2 - art.scroll_y) * art.pixel_scale + art.canvas_oy;
+        fb_draw_rect((uint32_t)(ox + sx1), (uint32_t)(oy + sy1),
+                     (uint32_t)(sx2 - sx1), (uint32_t)(sy2 - sy1), COLOR_HIGHLIGHT);
+    }
+
+    /* Bezier control point markers */
+    if (art.tool == ARTOS_TOOL_BEZIER && art.bezier_count > 0) {
+        for (int bi = 0; bi < art.bezier_count; bi++) {
+            int bpx = (art.bezier_pts[bi][0] - art.scroll_x) * art.pixel_scale + art.canvas_ox;
+            int bpy = (art.bezier_pts[bi][1] - art.scroll_y) * art.pixel_scale + art.canvas_oy;
+            fb_fill_rect((uint32_t)(ox + bpx - 2), (uint32_t)(oy + bpy - 2), 5, 5, 0x00FF4444);
+            fb_draw_rect((uint32_t)(ox + bpx - 3), (uint32_t)(oy + bpy - 3), 7, 7, COLOR_WHITE);
+        }
+    }
+
+    /* Clone source crosshair */
+    if (art.tool == ARTOS_TOOL_CLONE && art.clone_src_set) {
+        int csx = (art.clone_src_x - art.scroll_x) * art.pixel_scale + art.canvas_ox;
+        int csy = (art.clone_src_y - art.scroll_y) * art.pixel_scale + art.canvas_oy;
+        /* Horizontal line */
+        for (int ci = -4; ci <= 4; ci++)
+            if (ci != 0)
+                fb_fill_rect((uint32_t)(ox + csx + ci), (uint32_t)(oy + csy), 1, 1, 0x0000FF00);
+        /* Vertical line */
+        for (int ci = -4; ci <= 4; ci++)
+            if (ci != 0)
+                fb_fill_rect((uint32_t)(ox + csx), (uint32_t)(oy + csy + ci), 1, 1, 0x0000FF00);
+    }
+
+    /* Grid overlay when snap enabled */
+    if (art.grid_snap && art.zoom >= 2) {
+        int gs = art.grid_size * art.pixel_scale;
+        int gsx = art.canvas_ox - (art.scroll_x % art.grid_size) * art.pixel_scale;
+        int gsy = ARTOS_TOOLBAR_H - (art.scroll_y % art.grid_size) * art.pixel_scale;
+        int canvas_px_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
+        for (int gx = gsx; gx < art.canvas_ox + ARTOS_CANVAS_W * art.pixel_scale; gx += gs)
+            for (int gy = 0; gy < canvas_px_h; gy += 4)
+                fb_fill_rect((uint32_t)(ox + gx), (uint32_t)(oy + ARTOS_TOOLBAR_H + gy), 1, 1, 0x40808080);
+        for (int gy = gsy; gy < canvas_px_h; gy += gs)
+            for (int gx = 0; gx < art.canvas_ox + ARTOS_CANVAS_W * art.pixel_scale - art.canvas_ox; gx += 4)
+                fb_fill_rect((uint32_t)(ox + art.canvas_ox + gx), (uint32_t)(oy + ARTOS_TOOLBAR_H + gy), 1, 1, 0x40808080);
+    }
+
+    /* Mirror mode center line indicator */
+    if (art.mirror_mode) {
+        int mcx = (ARTOS_CANVAS_W / 2 - art.scroll_x) * art.pixel_scale + art.canvas_ox;
+        int canvas_px_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
+        for (int my = 0; my < canvas_px_h; my += 2)
+            fb_fill_rect((uint32_t)(ox + mcx), (uint32_t)(oy + ARTOS_TOOLBAR_H + my), 1, 1, 0x00FF00FF);
+    }
+
+    /* Star sides indicator */
+    if (art.tool == ARTOS_TOOL_STAR) {
+        char stxt[8]; stxt[0] = '0' + (char)art.star_sides; stxt[1] = 'p'; stxt[2] = 't'; stxt[3] = '\0';
+        font_draw_string((uint32_t)(ox + cw - 30), (uint32_t)(oy + ARTOS_TOOLBAR_H + 2), stxt, 0x00FFFF00, 0x00333333);
+    }
+
+    /* === BOTTOM PALETTE (44px) === */
+    int pal_y = ch - ARTOS_PALETTE_H;
+    fb_fill_rect((uint32_t)ox, (uint32_t)(oy + pal_y), (uint32_t)cw, (uint32_t)ARTOS_PALETTE_H, tb_bg);
     gfx_draw_hline(ox, oy + pal_y, cw, COLOR_PANEL_BORDER);
 
-    /* 16 color swatches in a row */
-    int swatch_size = 20;
-    int swatch_gap = 4;
-    int pal_total_w = ARTOS_PALETTE_COUNT * (swatch_size + swatch_gap) - swatch_gap;
-    int pal_start_x = (cw - pal_total_w) / 2;
-    int swatch_y = pal_y + (art.palette_h - swatch_size) / 2;
-
+    /* 16 quick swatches (left side, 14x14) */
+    int ssz = 14, sgap = 2;
+    int srow_y = pal_y + 4;
     for (int i = 0; i < ARTOS_PALETTE_COUNT; i++) {
-        int sx = pal_start_x + i * (swatch_size + swatch_gap);
-        fb_fill_rect((uint32_t)(ox + sx), (uint32_t)(oy + swatch_y),
-                     (uint32_t)swatch_size, (uint32_t)swatch_size,
-                     artos_palette[i]);
-        /* Highlight if selected as FG */
-        uint32_t border = (artos_palette[i] == art.fg_color) ?
-                          COLOR_HIGHLIGHT : COLOR_TEXT_DIM;
-        fb_draw_rect((uint32_t)(ox + sx), (uint32_t)(oy + swatch_y),
-                     (uint32_t)swatch_size, (uint32_t)swatch_size,
-                     border);
+        int sx = 4 + i * (ssz + sgap);
+        fb_fill_rect((uint32_t)(ox + sx), (uint32_t)(oy + srow_y), (uint32_t)ssz, (uint32_t)ssz, artos_palette[i]);
+        uint32_t bd = (artos_palette[i] == art.fg_color) ? COLOR_HIGHLIGHT : COLOR_TEXT_DIM;
+        fb_draw_rect((uint32_t)(ox + sx), (uint32_t)(oy + srow_y), (uint32_t)ssz, (uint32_t)ssz, bd);
     }
 
-    /* Status text */
-    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + pal_y + 4),
-                     "ArtOS", COLOR_ICON_PURPLE, 0xFF111827);
-    if (art.modified) {
-        font_draw_string((uint32_t)(ox + 52), (uint32_t)(oy + pal_y + 4),
-                         "*", COLOR_HIGHLIGHT, 0xFF111827);
+    /* HSV Hue bar (right side) */
+    int hue_x = 280;
+    for (int hx = 0; hx < ARTOS_HUE_BAR_W; hx++) {
+        uint32_t hc = hsv_to_rgb(hx * 360 / ARTOS_HUE_BAR_W, 255, 255);
+        fb_fill_rect((uint32_t)(ox + hue_x + hx), (uint32_t)(oy + pal_y + 4), 1, (uint32_t)ARTOS_HUE_BAR_H, hc);
     }
+    /* Hue marker */
+    { int hm = hue_x + art.hsv_h * ARTOS_HUE_BAR_W / 360;
+      fb_draw_rect((uint32_t)(ox + hm - 1), (uint32_t)(oy + pal_y + 3), 3, (uint32_t)(ARTOS_HUE_BAR_H + 2), COLOR_WHITE); }
 
-    /* Canvas size info */
-    font_draw_string((uint32_t)(ox + cw - 80), (uint32_t)(oy + pal_y + 4),
-                     "128x96", COLOR_TEXT_DIM, 0xFF111827);
+    /* SV box */
+    int sv_x = 416;
+    for (int sy2 = 0; sy2 < ARTOS_SV_BOX_SIZE; sy2++) {
+        for (int sx2 = 0; sx2 < ARTOS_SV_BOX_SIZE; sx2++) {
+            int s = sx2 * 255 / (ARTOS_SV_BOX_SIZE - 1);
+            int v = (ARTOS_SV_BOX_SIZE - 1 - sy2) * 255 / (ARTOS_SV_BOX_SIZE - 1);
+            uint32_t pc = hsv_to_rgb(art.hsv_h, s, v);
+            fb_fill_rect((uint32_t)(ox + sv_x + sx2), (uint32_t)(oy + pal_y + 4 + sy2), 1, 1, pc);
+        }
+    }
+    fb_draw_rect((uint32_t)(ox + sv_x), (uint32_t)(oy + pal_y + 4),
+                 (uint32_t)ARTOS_SV_BOX_SIZE, (uint32_t)ARTOS_SV_BOX_SIZE, COLOR_TEXT_DIM);
 
-    /* Draw DrawNet peer cursors */
+    /* Color preview */
+    fb_fill_rect((uint32_t)(ox + 454), (uint32_t)(oy + pal_y + 4), 20, 20, art.fg_color);
+    fb_draw_rect((uint32_t)(ox + 454), (uint32_t)(oy + pal_y + 4), 20, 20, COLOR_TEXT_DIM);
+
+    /* Status line */
+    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + pal_y + 24), "ArtOS", COLOR_ICON_PURPLE, tb_bg);
+    if (art.modified)
+        font_draw_string((uint32_t)(ox + 52), (uint32_t)(oy + pal_y + 24), "*", COLOR_HIGHLIGHT, tb_bg);
+
+    /* Canvas info */
+    { char info[32]; strcpy(info, "256x192 z:");
+      info[10] = '0' + (char)art.zoom; info[11] = 'x'; info[12] = ' '; info[13] = 'L';
+      info[14] = '1' + (char)art.active_layer; info[15] = '\0';
+      font_draw_string((uint32_t)(ox + cw - 128), (uint32_t)(oy + pal_y + 24), info, COLOR_TEXT_DIM, tb_bg); }
+
+    /* DrawNet peer cursors */
     drawnet_paint_cursors(win);
 }
 
@@ -6628,28 +7390,92 @@ static void artos_paint(struct wm_window *win)
  * button flags: bit0=left, bit6(0x40)=release, bit7(0x80)=drag motion */
 static void artos_click(struct wm_window *win, int x, int y, int button)
 {
+    int cw = wm_content_width(win);
+    int ch = wm_content_height(win);
+    int cp_w = cw - ARTOS_LAYER_PANEL_W;
     int is_drag = (button & 0x80) != 0;
     int is_release = (button & 0x40) != 0;
+    uint32_t *layer_px = art.layers[art.active_layer].pixels;
 
-    /* === Handle drag (pencil/eraser continuous drawing, shape preview) === */
+    /* === Handle drag (continuous drawing, shape preview, selection move) === */
     if (is_drag && art.drawing) {
         int cx_coord, cy_coord;
         if (artos_screen_to_canvas(x, y, &cx_coord, &cy_coord)) {
+            artos_snap(&cx_coord, &cy_coord);
             uint32_t draw_color = (art.tool == ARTOS_TOOL_ERASER) ? art.bg_color : art.fg_color;
 
             if (art.tool == ARTOS_TOOL_PENCIL || art.tool == ARTOS_TOOL_ERASER) {
-                /* Draw line from last position to current */
                 artos_line(art.last_cx, art.last_cy, cx_coord, cy_coord,
                            draw_color, art.brush_size);
-                /* Push to DrawNet */
+                if (art.mirror_mode)
+                    artos_line(ARTOS_CANVAS_W-1-art.last_cx, art.last_cy,
+                               ARTOS_CANVAS_W-1-cx_coord, cy_coord,
+                               draw_color, art.brush_size);
                 drawnet_push_stroke(art.tool, art.last_cx, art.last_cy,
                                     cx_coord, cy_coord, draw_color, art.brush_size);
                 art.last_cx = cx_coord;
                 art.last_cy = cy_coord;
+            } else if (art.tool == ARTOS_TOOL_SPRAY) {
+                artos_spray(cx_coord, cy_coord, art.fg_color, art.brush_size * 3);
+                if (art.mirror_mode)
+                    artos_spray(ARTOS_CANVAS_W-1-cx_coord, cy_coord, art.fg_color, art.brush_size * 3);
+            } else if (art.tool == ARTOS_TOOL_CALLIG) {
+                artos_callig_line(art.last_cx, art.last_cy, cx_coord, cy_coord,
+                                  draw_color, art.brush_size);
+                if (art.mirror_mode)
+                    artos_callig_line(ARTOS_CANVAS_W-1-art.last_cx, art.last_cy,
+                                      ARTOS_CANVAS_W-1-cx_coord, cy_coord,
+                                      draw_color, art.brush_size);
+                art.last_cx = cx_coord; art.last_cy = cy_coord;
+            } else if (art.tool == ARTOS_TOOL_SOFTBRUSH) {
+                artos_soft_plot(cx_coord, cy_coord, draw_color, art.brush_size);
+                if (art.mirror_mode)
+                    artos_soft_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, draw_color, art.brush_size);
+                art.last_cx = cx_coord; art.last_cy = cy_coord;
+            } else if (art.tool == ARTOS_TOOL_PATBRUSH) {
+                artos_pattern_plot(cx_coord, cy_coord, art.brush_size);
+                if (art.mirror_mode)
+                    artos_pattern_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, art.brush_size);
+                art.last_cx = cx_coord; art.last_cy = cy_coord;
+            } else if (art.tool == ARTOS_TOOL_CLONE && art.clone_src_set) {
+                artos_clone_plot(cx_coord, cy_coord, art.brush_size);
+                art.last_cx = cx_coord; art.last_cy = cy_coord;
+            } else if (art.tool == ARTOS_TOOL_SMUDGE) {
+                artos_smudge_apply(cx_coord, cy_coord, art.brush_size);
+                art.last_cx = cx_coord; art.last_cy = cy_coord;
+            } else if (art.tool == ARTOS_TOOL_SELECT) {
+                if (art.sel_moving) {
+                    int ddx = cx_coord - art.sel_move_ox;
+                    int ddy = cy_coord - art.sel_move_oy;
+                    if (ddx != 0 || ddy != 0) {
+                        int sw = art.sel_x2 - art.sel_x1;
+                        int sh = art.sel_y2 - art.sel_y1;
+                        for (int sy = art.sel_y1; sy < art.sel_y2; sy++)
+                            for (int sx = art.sel_x1; sx < art.sel_x2; sx++)
+                                if (sx >= 0 && sx < ARTOS_CANVAS_W && sy >= 0 && sy < ARTOS_CANVAS_H)
+                                    artos_canvas_set(sx, sy, art.bg_color);
+                        art.sel_x1 += ddx; art.sel_y1 += ddy;
+                        art.sel_x2 += ddx; art.sel_y2 += ddy;
+                        for (int sy = 0; sy < sh; sy++)
+                            for (int sx = 0; sx < sw; sx++) {
+                                int nx = art.sel_x1 + sx, ny = art.sel_y1 + sy;
+                                if (nx >= 0 && nx < ARTOS_CANVAS_W && ny >= 0 && ny < ARTOS_CANVAS_H)
+                                    artos_canvas_set(nx, ny, art.sel_buf[sy * ARTOS_CANVAS_W + sx]);
+                            }
+                        art.sel_move_ox = cx_coord;
+                        art.sel_move_oy = cy_coord;
+                    }
+                } else {
+                    art.sel_x2 = cx_coord;
+                    art.sel_y2 = cy_coord;
+                }
             } else if (art.tool == ARTOS_TOOL_LINE || art.tool == ARTOS_TOOL_RECT ||
-                       art.tool == ARTOS_TOOL_FILLRECT || art.tool == ARTOS_TOOL_ELLIPSE) {
-                /* Restore saved canvas and draw shape preview */
-                memcpy(art.canvas, art.shape_save,
+                       art.tool == ARTOS_TOOL_FILLRECT || art.tool == ARTOS_TOOL_ELLIPSE ||
+                       art.tool == ARTOS_TOOL_RNDRECT || art.tool == ARTOS_TOOL_CIRCLE ||
+                       art.tool == ARTOS_TOOL_STAR || art.tool == ARTOS_TOOL_ARROW ||
+                       art.tool == ARTOS_TOOL_GRADFILL) {
+                /* Restore saved layer and draw shape preview */
+                memcpy(layer_px, art.shape_save,
                        sizeof(uint32_t) * ARTOS_CANVAS_W * ARTOS_CANVAS_H);
                 if (art.tool == ARTOS_TOOL_LINE) {
                     artos_line(art.start_cx, art.start_cy, cx_coord, cy_coord,
@@ -6668,117 +7494,300 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
                     if (erx < 0) erx = -erx;
                     if (ery < 0) ery = -ery;
                     artos_ellipse(ecx, ecy, erx, ery, art.fg_color);
+                } else if (art.tool == ARTOS_TOOL_RNDRECT) {
+                    artos_round_rect(art.start_cx, art.start_cy, cx_coord, cy_coord,
+                                     art.fg_color, art.brush_size * 2);
+                } else if (art.tool == ARTOS_TOOL_CIRCLE) {
+                    int ddx = cx_coord - art.start_cx;
+                    int ddy = cy_coord - art.start_cy;
+                    int r = isqrt(ddx * ddx + ddy * ddy);
+                    artos_ellipse(art.start_cx, art.start_cy, r, r, art.fg_color);
+                } else if (art.tool == ARTOS_TOOL_STAR) {
+                    int ddx = cx_coord - art.start_cx;
+                    int ddy = cy_coord - art.start_cy;
+                    int r = isqrt(ddx * ddx + ddy * ddy);
+                    artos_star(art.start_cx, art.start_cy, r, art.star_sides, art.fg_color);
+                } else if (art.tool == ARTOS_TOOL_ARROW) {
+                    artos_arrow(art.start_cx, art.start_cy, cx_coord, cy_coord,
+                                art.fg_color, art.brush_size);
+                } else if (art.tool == ARTOS_TOOL_GRADFILL) {
+                    artos_grad_fill(art.start_cx, art.start_cy, cx_coord, cy_coord);
                 }
             }
         }
         return;
     }
 
-    /* === Handle release (finalize shape) === */
+    /* === Handle release (finalize shape / selection) === */
     if (is_release) {
+        if (art.tool == ARTOS_TOOL_SELECT && art.drawing && !art.sel_moving) {
+            /* Normalize selection rectangle */
+            if (art.sel_x1 > art.sel_x2) { int t = art.sel_x1; art.sel_x1 = art.sel_x2; art.sel_x2 = t; }
+            if (art.sel_y1 > art.sel_y2) { int t = art.sel_y1; art.sel_y1 = art.sel_y2; art.sel_y2 = t; }
+            /* Clamp to canvas */
+            if (art.sel_x1 < 0) art.sel_x1 = 0;
+            if (art.sel_y1 < 0) art.sel_y1 = 0;
+            if (art.sel_x2 > ARTOS_CANVAS_W) art.sel_x2 = ARTOS_CANVAS_W;
+            if (art.sel_y2 > ARTOS_CANVAS_H) art.sel_y2 = ARTOS_CANVAS_H;
+            /* Save selection contents */
+            int sw = art.sel_x2 - art.sel_x1;
+            int sh = art.sel_y2 - art.sel_y1;
+            if (sw > 0 && sh > 0) {
+                art.sel_active = 1;
+                for (int sy = 0; sy < sh; sy++)
+                    for (int sx = 0; sx < sw; sx++)
+                        art.sel_buf[sy * ARTOS_CANVAS_W + sx] =
+                            artos_canvas_get(art.sel_x1 + sx, art.sel_y1 + sy);
+            }
+        }
         art.drawing = 0;
+        art.sel_moving = 0;
         return;
     }
 
     /* === Normal click (initial press) === */
 
-    /* Toolbar row 1: tool buttons */
+    /* Deactivate text input fields when clicking elsewhere */
+    int clicked_ai = 0, clicked_dn = 0;
+
+    /* Row A (y=2..19): tools 0-5 */
     if (y >= 2 && y < 20) {
-        int btn_x = 4;
-        for (int i = 0; i < ARTOS_TOOL_COUNT; i++) {
-            if (x >= btn_x && x < btn_x + 48) {
+        for (int i = 0; i < 6; i++) {
+            int bx = 4 + i * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+            if (x >= bx && x < bx + ARTOS_BTN_W) {
                 art.tool = i;
+                art.text_active = 0;
                 return;
             }
-            btn_x += 50;
         }
     }
 
-    /* Toolbar row 2: Undo, Clear, Size +/-, Swap */
-    int row2_y = 24;
-    if (y >= row2_y && y < row2_y + 18) {
-        if (x >= 4 && x < 44) {
-            artos_undo();
-            return;
+    /* Row B (y=22..39): tools 6-11 */
+    if (y >= 22 && y < 40) {
+        for (int i = 6; i < 12; i++) {
+            int bx = 4 + (i - 6) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+            if (x >= bx && x < bx + ARTOS_BTN_W) {
+                art.tool = i;
+                art.text_active = 0;
+                art.sel_active = 0;
+                art.poly_count = 0;
+                return;
+            }
         }
-        if (x >= 48 && x < 92) {
+    }
+
+    /* Row C (y=42..59): tools 12-17 */
+    if (y >= 42 && y < 60) {
+        for (int i = 12; i < 18; i++) {
+            int bx = 4 + (i - 12) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+            if (x >= bx && x < bx + ARTOS_BTN_W) {
+                art.tool = i;
+                art.text_active = 0; art.sel_active = 0;
+                art.poly_count = 0; art.bezier_count = 0;
+                if (i == ARTOS_TOOL_CLONE) art.clone_src_set = 0;
+                return;
+            }
+        }
+    }
+
+    /* Row D (y=62..79): tools 18-23 */
+    if (y >= 62 && y < 80) {
+        for (int i = 18; i < ARTOS_TOOL_COUNT; i++) {
+            int bx = 4 + (i - 18) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
+            if (x >= bx && x < bx + ARTOS_BTN_W) {
+                art.tool = i;
+                art.text_active = 0; art.sel_active = 0;
+                art.poly_count = 0; art.bezier_count = 0;
+                if (i == ARTOS_TOOL_CLONE) art.clone_src_set = 0;
+                return;
+            }
+        }
+    }
+
+    /* Row E (y=82..99): Undo, Clear, Size, Opacity, FG, BG, Swap, Zoom, Mirror, Grid */
+    if (y >= 82 && y < 100) {
+        /* Undo (x=4..39) */
+        if (x >= 4 && x < 40) { artos_undo(); return; }
+        /* Clear (x=44..79) */
+        if (x >= 44 && x < 80) {
             artos_undo_push();
             for (int i = 0; i < ARTOS_CANVAS_W * ARTOS_CANVAS_H; i++)
-                art.canvas[i] = art.bg_color;
+                layer_px[i] = art.bg_color;
             art.modified = 1;
             return;
         }
-        if (x >= 144 && x < 162) {
-            if (art.brush_size > 1) art.brush_size--;
+        /* Size - (x=104..119) */
+        if (x >= 104 && x < 120) { if (art.brush_size > 1) art.brush_size--; return; }
+        /* Size + (x=136..151) */
+        if (x >= 136 && x < 152) { if (art.brush_size < ARTOS_MAX_BRUSH) art.brush_size++; return; }
+        /* Opacity - (x=176..191) */
+        if (x >= 176 && x < 192) {
+            if (art.brush_opacity > ARTOS_OPACITY_STEP) art.brush_opacity -= ARTOS_OPACITY_STEP;
+            else art.brush_opacity = 1;
             return;
         }
-        if (x >= 178 && x < 196) {
-            if (art.brush_size < 5) art.brush_size++;
+        /* Opacity + (x=212..227) */
+        if (x >= 212 && x < 228) {
+            art.brush_opacity += ARTOS_OPACITY_STEP;
+            if (art.brush_opacity > ARTOS_MAX_OPACITY) art.brush_opacity = ARTOS_MAX_OPACITY;
             return;
         }
-        if (x >= 316 && x < 348) {
+        /* FG swatch (x=236..253) */
+        if (x >= 236 && x < 254) return; /* Just visual indicator */
+        /* BG swatch (x=258..275) */
+        if (x >= 258 && x < 276) return;
+        /* Swap (x=280..307) */
+        if (x >= 280 && x < 308) {
             uint32_t tmp = art.fg_color;
             art.fg_color = art.bg_color;
             art.bg_color = tmp;
             return;
         }
+        /* Zoom - (x=334..349) */
+        if (x >= 334 && x < 350) { if (art.zoom > 1) art.zoom--; return; }
+        /* Zoom + (x=364..379) */
+        if (x >= 364 && x < 380) { if (art.zoom < 3) art.zoom++; return; }
+        /* Mirror toggle (x=388..415) */
+        if (x >= 388 && x < 416) { art.mirror_mode = !art.mirror_mode; return; }
+        /* Grid snap toggle (x=420..447) */
+        if (x >= 420 && x < 448) { art.grid_snap = !art.grid_snap; return; }
     }
 
-    /* Toolbar row 3: AI Art Generator */
-    int row3_y = row2_y + 22;
-    if (y >= row3_y && y < row3_y + 18) {
-        /* AI prompt field */
+    /* Row F (y=102..119): AI prompt + Generate */
+    if (y >= 102 && y < 120) {
         if (x >= 26 && x < 306) {
             art.ai_input_active = 1;
+            art.drawnet_input_active = 0;
+            art.text_active = 0;
+            clicked_ai = 1;
             return;
         }
-        /* Generate button */
-        if (x >= 312 && x < 372) {
+        if (x >= 312 && x < 368) {
             generate_ai_art();
             art.ai_input_active = 0;
             return;
         }
     }
 
-    /* Toolbar row 4: DrawNet */
-    int row4_y = row3_y + 22;
-    if (y >= row4_y && y < row4_y + 18) {
-        /* Session ID input field */
+    /* Row G (y=120..131): DrawNet session + Go/Stop */
+    if (y >= 120 && y < ARTOS_TOOLBAR_H) {
         if (x >= 32 && x < 112) {
             art.drawnet_input_active = 1;
-            art.ai_input_active = 0;  /* Deactivate AI input */
+            art.ai_input_active = 0;
+            art.text_active = 0;
+            clicked_dn = 1;
             return;
         }
-        /* Start/Stop button */
-        if (x >= 118 && x < 158) {
+        if (x >= 118 && x < 154) {
             if (art.drawnet_enabled) {
                 drawnet_stop_session();
             } else {
-                if (art.drawnet_input[0]) {
+                if (art.drawnet_input[0])
                     drawnet_init_session(art.drawnet_input);
-                }
             }
             art.drawnet_input_active = 0;
             return;
         }
     }
 
-    /* Canvas click (begin drawing) */
+    /* Deactivate text fields if not clicked */
+    if (!clicked_ai) art.ai_input_active = 0;
+    if (!clicked_dn) art.drawnet_input_active = 0;
+
+    /* === Layer panel clicks (right side) === */
+    int ca_y = ARTOS_TOOLBAR_H;
+    int ca_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
+    if (x >= cp_w && y >= ca_y && y < ca_y + ca_h) {
+        int lx = x - cp_w; /* local x within panel */
+        int ly = y - ca_y; /* local y within panel */
+
+        /* Layer entries: each 24px tall starting at ly=22 */
+        for (int l = 0; l < art.layer_count; l++) {
+            int ey = 22 + l * 24;
+            if (ly >= ey && ly < ey + 22) {
+                /* Eye icon (x 4..11 within panel) */
+                if (lx >= 4 && lx < 12) {
+                    art.layers[l].visible = !art.layers[l].visible;
+                    return;
+                }
+                /* Click on layer name = switch to it */
+                artos_switch_layer(l);
+                return;
+            }
+        }
+
+        /* Add layer button */
+        if (art.layer_count < ARTOS_MAX_LAYERS) {
+            int aby = 22 + art.layer_count * 24 + 4;
+            if (ly >= aby && ly < aby + 16 && lx >= 4 && lx < 56) {
+                int nl = art.layer_count;
+                art.layer_count++;
+                art.layers[nl].visible = 1;
+                art.layers[nl].opacity = 255;
+                art.layers[nl].name[0] = 'L'; art.layers[nl].name[1] = 'y';
+                art.layers[nl].name[2] = 'r'; art.layers[nl].name[3] = ' ';
+                art.layers[nl].name[4] = '1' + (char)nl; art.layers[nl].name[5] = '\0';
+                for (int i = 0; i < ARTOS_CANVAS_W * ARTOS_CANVAS_H; i++)
+                    art.layers[nl].pixels[i] = 0x00000000; /* transparent */
+                artos_switch_layer(nl);
+                return;
+            }
+        }
+
+        /* Flatten button */
+        if (art.layer_count > 1) {
+            int fby = 22 + ARTOS_MAX_LAYERS * 24 + 8;
+            if (ly >= fby && ly < fby + 16 && lx >= 4 && lx < 56) {
+                artos_flatten_layers();
+                return;
+            }
+        }
+
+        /* Layer opacity controls (bottom of panel) */
+        int loy = ca_h - 40;
+        if (ly >= loy + 14 && ly < loy + 28) {
+            /* Opacity - */
+            if (lx >= 4 && lx < 20) {
+                int o = art.layers[art.active_layer].opacity;
+                o -= ARTOS_OPACITY_STEP;
+                if (o < 0) o = 0;
+                art.layers[art.active_layer].opacity = (uint8_t)o;
+                return;
+            }
+            /* Opacity + */
+            if (lx >= 40 && lx < 56) {
+                int o = art.layers[art.active_layer].opacity;
+                o += ARTOS_OPACITY_STEP;
+                if (o > 255) o = 255;
+                art.layers[art.active_layer].opacity = (uint8_t)o;
+                return;
+            }
+        }
+        return;
+    }
+
+    /* === Canvas click (begin drawing) === */
     int cx_coord, cy_coord;
     if (artos_screen_to_canvas(x, y, &cx_coord, &cy_coord)) {
+        artos_snap(&cx_coord, &cy_coord);
         uint32_t draw_color = (art.tool == ARTOS_TOOL_ERASER) ? art.bg_color : art.fg_color;
 
         if (art.tool == ARTOS_TOOL_PENCIL || art.tool == ARTOS_TOOL_ERASER) {
             artos_undo_push();
             artos_plot(cx_coord, cy_coord, draw_color, art.brush_size);
+            if (art.mirror_mode)
+                artos_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, draw_color, art.brush_size);
             art.drawing = 1;
             art.last_cx = cx_coord;
             art.last_cy = cy_coord;
             art.modified = 1;
         } else if (art.tool == ARTOS_TOOL_LINE || art.tool == ARTOS_TOOL_RECT ||
-                   art.tool == ARTOS_TOOL_FILLRECT || art.tool == ARTOS_TOOL_ELLIPSE) {
+                   art.tool == ARTOS_TOOL_FILLRECT || art.tool == ARTOS_TOOL_ELLIPSE ||
+                   art.tool == ARTOS_TOOL_RNDRECT || art.tool == ARTOS_TOOL_CIRCLE ||
+                   art.tool == ARTOS_TOOL_STAR || art.tool == ARTOS_TOOL_ARROW ||
+                   art.tool == ARTOS_TOOL_GRADFILL) {
             artos_undo_push();
-            memcpy(art.shape_save, art.canvas,
+            memcpy(art.shape_save, layer_px,
                    sizeof(uint32_t) * ARTOS_CANVAS_W * ARTOS_CANVAS_H);
             art.drawing = 1;
             art.start_cx = cx_coord;
@@ -6788,28 +7797,165 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
             artos_undo_push();
             artos_flood_fill(cx_coord, cy_coord, art.fg_color);
             art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_DITHFILL) {
+            artos_undo_push();
+            artos_dither_fill(cx_coord, cy_coord);
+            art.modified = 1;
         } else if (art.tool == ARTOS_TOOL_EYEDROP) {
             art.fg_color = artos_canvas_get(cx_coord, cy_coord);
+            rgb_to_hsv(art.fg_color, &art.hsv_h, &art.hsv_s, &art.hsv_v);
+        } else if (art.tool == ARTOS_TOOL_TEXT) {
+            art.text_cx = cx_coord;
+            art.text_cy = cy_coord;
+            art.text_active = 1;
+            art.text_cursor = 0;
+            art.text_buf[0] = '\0';
+            artos_undo_push();
+            art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_POLYGON) {
+            if (art.poly_count > 2) {
+                int pdx = cx_coord - art.poly_verts[0][0];
+                int pdy = cy_coord - art.poly_verts[0][1];
+                if (pdx < 0) pdx = -pdx;
+                if (pdy < 0) pdy = -pdy;
+                if (pdx < 5 && pdy < 5) {
+                    artos_undo_push();
+                    artos_close_polygon();
+                    art.poly_count = 0;
+                    art.modified = 1;
+                    return;
+                }
+            }
+            if (art.poly_count < ARTOS_MAX_POLY_VERTS) {
+                if (art.poly_count == 0) artos_undo_push();
+                art.poly_verts[art.poly_count][0] = cx_coord;
+                art.poly_verts[art.poly_count][1] = cy_coord;
+                art.poly_count++;
+                if (art.poly_count > 1) {
+                    int pi = art.poly_count - 2;
+                    artos_line(art.poly_verts[pi][0], art.poly_verts[pi][1],
+                               cx_coord, cy_coord, art.fg_color, art.brush_size);
+                    art.modified = 1;
+                }
+            }
+        } else if (art.tool == ARTOS_TOOL_BEZIER) {
+            art.bezier_pts[art.bezier_count][0] = cx_coord;
+            art.bezier_pts[art.bezier_count][1] = cy_coord;
+            art.bezier_count++;
+            if (art.bezier_count >= 4) {
+                artos_undo_push();
+                artos_bezier(art.bezier_pts[0][0], art.bezier_pts[0][1],
+                             art.bezier_pts[1][0], art.bezier_pts[1][1],
+                             art.bezier_pts[2][0], art.bezier_pts[2][1],
+                             art.bezier_pts[3][0], art.bezier_pts[3][1],
+                             art.fg_color, art.brush_size);
+                art.bezier_count = 0;
+                art.modified = 1;
+            }
+        } else if (art.tool == ARTOS_TOOL_SPRAY) {
+            artos_undo_push();
+            artos_spray(cx_coord, cy_coord, art.fg_color, art.brush_size * 3);
+            if (art.mirror_mode)
+                artos_spray(ARTOS_CANVAS_W-1-cx_coord, cy_coord, art.fg_color, art.brush_size * 3);
+            art.drawing = 1;
+            art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_CALLIG) {
+            artos_undo_push();
+            artos_callig_plot(cx_coord, cy_coord, draw_color, art.brush_size);
+            if (art.mirror_mode)
+                artos_callig_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, draw_color, art.brush_size);
+            art.drawing = 1;
+            art.last_cx = cx_coord; art.last_cy = cy_coord;
+            art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_SOFTBRUSH) {
+            artos_undo_push();
+            artos_soft_plot(cx_coord, cy_coord, draw_color, art.brush_size);
+            if (art.mirror_mode)
+                artos_soft_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, draw_color, art.brush_size);
+            art.drawing = 1;
+            art.last_cx = cx_coord; art.last_cy = cy_coord;
+            art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_PATBRUSH) {
+            artos_undo_push();
+            artos_pattern_plot(cx_coord, cy_coord, art.brush_size);
+            if (art.mirror_mode)
+                artos_pattern_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, art.brush_size);
+            art.drawing = 1;
+            art.last_cx = cx_coord; art.last_cy = cy_coord;
+            art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_CLONE) {
+            if (!art.clone_src_set) {
+                art.clone_src_x = cx_coord;
+                art.clone_src_y = cy_coord;
+                art.clone_src_set = 1;
+            } else {
+                art.clone_off_x = art.clone_src_x - cx_coord;
+                art.clone_off_y = art.clone_src_y - cy_coord;
+                artos_undo_push();
+                artos_clone_plot(cx_coord, cy_coord, art.brush_size);
+                art.drawing = 1;
+                art.last_cx = cx_coord; art.last_cy = cy_coord;
+                art.modified = 1;
+            }
+        } else if (art.tool == ARTOS_TOOL_SMUDGE) {
+            artos_undo_push();
+            artos_smudge_pickup(cx_coord, cy_coord, art.brush_size);
+            art.drawing = 1;
+            art.last_cx = cx_coord; art.last_cy = cy_coord;
+            art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_SELECT) {
+            if (art.sel_active &&
+                cx_coord >= art.sel_x1 && cx_coord < art.sel_x2 &&
+                cy_coord >= art.sel_y1 && cy_coord < art.sel_y2) {
+                art.sel_moving = 1;
+                art.sel_move_ox = cx_coord;
+                art.sel_move_oy = cy_coord;
+                art.drawing = 1;
+                artos_undo_push();
+            } else {
+                art.sel_active = 0;
+                art.sel_moving = 0;
+                art.sel_x1 = cx_coord; art.sel_y1 = cy_coord;
+                art.sel_x2 = cx_coord; art.sel_y2 = cy_coord;
+                art.drawing = 1;
+            }
         }
         return;
     }
 
-    /* Palette click */
-    int pal_y_start = wm_content_height(win) - art.palette_h;
-    if (y >= pal_y_start) {
-        int swatch_size = 20;
-        int swatch_gap = 4;
-        int pal_total_w = ARTOS_PALETTE_COUNT * (swatch_size + swatch_gap) - swatch_gap;
-        int pal_start_x = (wm_content_width(win) - pal_total_w) / 2;
-        int swatch_y_off = pal_y_start + (art.palette_h - swatch_size) / 2;
+    /* === Bottom palette clicks === */
+    int pal_y = ch - ARTOS_PALETTE_H;
+    if (y >= pal_y) {
+        int py = y - pal_y;
 
-        for (int i = 0; i < ARTOS_PALETTE_COUNT; i++) {
-            int sx = pal_start_x + i * (swatch_size + swatch_gap);
-            if (x >= sx && x < sx + swatch_size &&
-                y >= swatch_y_off && y < swatch_y_off + swatch_size) {
-                art.fg_color = artos_palette[i];
-                return;
+        /* 16 quick swatches: x=4.., 14px wide, 2px gap, y offset 4 */
+        if (py >= 4 && py < 18) {
+            for (int i = 0; i < ARTOS_PALETTE_COUNT; i++) {
+                int sx = 4 + i * (14 + 2);
+                if (x >= sx && x < sx + 14) {
+                    art.fg_color = artos_palette[i];
+                    rgb_to_hsv(art.fg_color, &art.hsv_h, &art.hsv_s, &art.hsv_v);
+                    return;
+                }
             }
+        }
+
+        /* HSV Hue bar: x=280..407, y=pal_y+4..pal_y+15 */
+        if (py >= 4 && py < 4 + ARTOS_HUE_BAR_H && x >= 280 && x < 280 + ARTOS_HUE_BAR_W) {
+            art.hsv_h = (x - 280) * 360 / ARTOS_HUE_BAR_W;
+            if (art.hsv_h > 359) art.hsv_h = 359;
+            art.fg_color = hsv_to_rgb(art.hsv_h, art.hsv_s, art.hsv_v);
+            return;
+        }
+
+        /* SV box: x=416..447, y=pal_y+4..pal_y+35 */
+        if (py >= 4 && py < 4 + ARTOS_SV_BOX_SIZE && x >= 416 && x < 416 + ARTOS_SV_BOX_SIZE) {
+            art.hsv_s = (x - 416) * 255 / (ARTOS_SV_BOX_SIZE - 1);
+            art.hsv_v = (ARTOS_SV_BOX_SIZE - 1 - (py - 4)) * 255 / (ARTOS_SV_BOX_SIZE - 1);
+            if (art.hsv_s > 255) art.hsv_s = 255;
+            if (art.hsv_v > 255) art.hsv_v = 255;
+            art.fg_color = hsv_to_rgb(art.hsv_h, art.hsv_s, art.hsv_v);
+            return;
         }
     }
 }
@@ -6819,15 +7965,38 @@ static void artos_key(struct wm_window *win, int key)
 {
     (void)win;
 
+    /* Text tool input mode — captures all printable keys */
+    if (art.text_active) {
+        if (key == 27) {
+            /* Escape: exit text mode */
+            art.text_active = 0;
+            return;
+        } else if (key == '\n' || key == '\r') {
+            /* Enter: newline */
+            art.text_cy += 16;
+            art.text_cx = art.poly_verts[0][0]; /* reuse for line start X (not great, but saves a field) */
+            return;
+        } else if (key == '\b' || key == 127) {
+            /* Backspace: crude — can't truly un-draw, just move cursor back */
+            if (art.text_cx >= 8) art.text_cx -= 8;
+            return;
+        } else if (key >= 32 && key < 127) {
+            /* Printable character: render onto canvas */
+            artos_render_text_char(art.text_cx, art.text_cy, (char)key, art.fg_color);
+            art.text_cx += 8;
+            art.modified = 1;
+            return;
+        }
+        return;
+    }
+
     /* AI prompt input mode */
     if (art.ai_input_active) {
         if (key == '\n' || key == '\r') {
-            /* Enter: generate art and deactivate */
             generate_ai_art();
             art.ai_input_active = 0;
             return;
         } else if (key == '\b' || key == 127) {
-            /* Backspace: remove last character */
             int len = 0;
             while (art.ai_prompt[len]) len++;
             if (len > 0) {
@@ -6836,11 +8005,9 @@ static void artos_key(struct wm_window *win, int key)
             }
             return;
         } else if (key == 27) {
-            /* Escape: deactivate input */
             art.ai_input_active = 0;
             return;
         } else if (key >= 32 && key < 127) {
-            /* Printable character: append to prompt */
             int len = 0;
             while (art.ai_prompt[len]) len++;
             if (len < 63) {
@@ -6856,25 +8023,18 @@ static void artos_key(struct wm_window *win, int key)
     /* DrawNet session ID input mode */
     if (art.drawnet_input_active) {
         if (key == '\n' || key == '\r') {
-            /* Enter: start session and deactivate */
-            if (art.drawnet_input[0]) {
+            if (art.drawnet_input[0])
                 drawnet_init_session(art.drawnet_input);
-            }
             art.drawnet_input_active = 0;
             return;
         } else if (key == '\b' || key == 127) {
-            /* Backspace: remove last character */
             int len = (int)strlen(art.drawnet_input);
-            if (len > 0) {
-                art.drawnet_input[len - 1] = '\0';
-            }
+            if (len > 0) art.drawnet_input[len - 1] = '\0';
             return;
         } else if (key == 27) {
-            /* Escape: deactivate input */
             art.drawnet_input_active = 0;
             return;
         } else if (key >= 32 && key < 127) {
-            /* Printable character: append to session ID */
             int len = (int)strlen(art.drawnet_input);
             if (len < 15) {
                 art.drawnet_input[len] = (char)key;
@@ -6885,28 +8045,111 @@ static void artos_key(struct wm_window *win, int key)
         return;
     }
 
-    /* Ctrl+Z style undo: just use 'u' or 'z' */
-    if (key == 'z' || key == 'u') {
-        artos_undo();
-    }
+    /* === Normal keyboard shortcuts === */
+
+    /* Undo */
+    if (key == 'z' || key == 'u') { artos_undo(); return; }
+
     /* Tool shortcuts */
-    else if (key == 'p') art.tool = ARTOS_TOOL_PENCIL;
-    else if (key == 'l') art.tool = ARTOS_TOOL_LINE;
-    else if (key == 'r') art.tool = ARTOS_TOOL_RECT;
-    else if (key == 'f') art.tool = ARTOS_TOOL_FILLRECT;
-    else if (key == 'e') art.tool = ARTOS_TOOL_ELLIPSE;
-    else if (key == 'g') art.tool = ARTOS_TOOL_FILL;
-    else if (key == 'x') {
-        /* Swap FG/BG */
+    if (key == 'p') { art.tool = ARTOS_TOOL_PENCIL; return; }
+    if (key == 'l') { art.tool = ARTOS_TOOL_LINE; return; }
+    if (key == 'r') { art.tool = ARTOS_TOOL_RECT; return; }
+    if (key == 'f') { art.tool = ARTOS_TOOL_FILLRECT; return; }
+    if (key == 'e') { art.tool = ARTOS_TOOL_ELLIPSE; return; }
+    if (key == 'g') { art.tool = ARTOS_TOOL_FILL; return; }
+    if (key == 't') { art.tool = ARTOS_TOOL_TEXT; return; }
+    if (key == 'n') { art.tool = ARTOS_TOOL_POLYGON; art.poly_count = 0; return; }
+    if (key == 's') { art.tool = ARTOS_TOOL_SPRAY; return; }
+    if (key == 'm') { art.tool = ARTOS_TOOL_SELECT; return; }
+    /* New v3 tool shortcuts */
+    if (key == 'o') { art.tool = ARTOS_TOOL_RNDRECT; return; }
+    if (key == 'c') { art.tool = ARTOS_TOOL_CIRCLE; return; }
+    if (key == 'w') { art.tool = ARTOS_TOOL_STAR; return; }
+    if (key == 'a') { art.tool = ARTOS_TOOL_ARROW; return; }
+    if (key == 'b') { art.tool = ARTOS_TOOL_BEZIER; art.bezier_count = 0; return; }
+    if (key == 'd') { art.tool = ARTOS_TOOL_SOFTBRUSH; return; }
+    if (key == 'k') { art.tool = ARTOS_TOOL_CLONE; art.clone_src_set = 0; return; }
+    if (key == 'j') { art.tool = ARTOS_TOOL_SMUDGE; return; }
+    if (key == 'i') { art.tool = ARTOS_TOOL_CALLIG; return; }
+    if (key == 'h') { art.tool = ARTOS_TOOL_DITHFILL; return; }
+
+    /* Star sides: number keys 3-8 when Star tool active */
+    if (art.tool == ARTOS_TOOL_STAR && key >= '3' && key <= '8') {
+        art.star_sides = key - '0';
+        return;
+    }
+
+    /* Grid size toggle: q key */
+    if (key == 'q') {
+        art.grid_size = (art.grid_size == 4) ? 8 : 4;
+        return;
+    }
+
+    /* Edit operations (Shift+key = uppercase) */
+    if (key == 'H') { artos_undo_push(); artos_flip_h(); art.modified = 1; return; }
+    if (key == 'V') { artos_undo_push(); artos_flip_v(); art.modified = 1; return; }
+    if (key == 'I') { artos_undo_push(); artos_invert(); art.modified = 1; return; }
+    if (key == 'B') { artos_undo_push(); artos_brightness(16); art.modified = 1; return; }
+    if (key == 'D') { artos_undo_push(); artos_brightness(-16); art.modified = 1; return; }
+    if (key == 'P') { artos_undo_push(); artos_posterize(); art.modified = 1; return; }
+    if (key == 'M') { art.mirror_mode = !art.mirror_mode; return; }
+    if (key == 'G') { art.grid_snap = !art.grid_snap; return; }
+
+    /* Swap FG/BG */
+    if (key == 'x') {
         uint32_t tmp = art.fg_color;
         art.fg_color = art.bg_color;
         art.bg_color = tmp;
+        return;
     }
-    else if (key == '[') {
-        if (art.brush_size > 1) art.brush_size--;
+
+    /* Brush size */
+    if (key == '[') { if (art.brush_size > 1) art.brush_size--; return; }
+    if (key == ']') { if (art.brush_size < ARTOS_MAX_BRUSH) art.brush_size++; return; }
+
+    /* Brush opacity */
+    if (key == '{') {
+        if (art.brush_opacity > ARTOS_OPACITY_STEP) art.brush_opacity -= ARTOS_OPACITY_STEP;
+        else art.brush_opacity = 1;
+        return;
     }
-    else if (key == ']') {
-        if (art.brush_size < 5) art.brush_size++;
+    if (key == '}') {
+        art.brush_opacity += ARTOS_OPACITY_STEP;
+        if (art.brush_opacity > ARTOS_MAX_OPACITY) art.brush_opacity = ARTOS_MAX_OPACITY;
+        return;
+    }
+
+    /* Zoom */
+    if (key == '+' || key == '=') { if (art.zoom < 3) art.zoom++; return; }
+    if (key == '-') { if (art.zoom > 1) art.zoom--; return; }
+
+    /* Pan (arrow keys — typically sent as escape sequences, but handle raw) */
+    /* Arrow keys from PS/2 come as scan codes mapped by our keyboard driver */
+    /* Using WASD-style for pan when zoomed: h/j/k/l or arrow surrogates */
+    if (key == 0x100) { art.scroll_x -= 8; if (art.scroll_x < 0) art.scroll_x = 0; return; } /* Left */
+    if (key == 0x101) { art.scroll_x += 8; return; } /* Right */
+    if (key == 0x102) { art.scroll_y -= 8; if (art.scroll_y < 0) art.scroll_y = 0; return; } /* Up */
+    if (key == 0x103) { art.scroll_y += 8; return; } /* Down */
+
+    /* Selection: Escape to deselect, Delete/Backspace to clear */
+    if (key == 27) {
+        art.sel_active = 0;
+        art.poly_count = 0;
+        art.text_active = 0;
+        art.bezier_count = 0;
+        art.clone_src_set = 0;
+        return;
+    }
+    if ((key == '\b' || key == 127) && art.sel_active) {
+        /* Clear selection area to bg color */
+        artos_undo_push();
+        for (int sy = art.sel_y1; sy < art.sel_y2; sy++)
+            for (int sx = art.sel_x1; sx < art.sel_x2; sx++)
+                if (sx >= 0 && sx < ARTOS_CANVAS_W && sy >= 0 && sy < ARTOS_CANVAS_H)
+                    artos_canvas_set(sx, sy, art.bg_color);
+        art.sel_active = 0;
+        art.modified = 1;
+        return;
     }
 }
 
@@ -7876,7 +9119,7 @@ static void launch_network(void)
 static void launch_artos(void)
 {
     if (artos_win > 0) return;
-    artos_win = wm_create_window(100, 50, 420, 400, "ArtOS - Digital Art Studio");
+    artos_win = wm_create_window(60, 20, 680, 580, "ArtOS - Digital Art Studio v2");
     if (artos_win > 0) {
         wm_set_on_close(artos_win, desktop_on_close);
         wm_set_on_paint(artos_win, artos_paint);

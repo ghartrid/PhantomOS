@@ -27,7 +27,7 @@ The core principle: **destruction is architecturally impossible**.
 |---------|-------------|
 | **Bare-metal x86_64 kernel** | Multiboot2 boot, long mode, 64-bit paging, IDT/PIC/PIT |
 | **Graphical desktop** | 32bpp framebuffer, window manager with draggable windows, sidebar, dock |
-| **25 interactive apps** | File Browser, Terminal, ArtOS, MusiKey, Notes, PVE Encrypt, and more |
+| **25 interactive apps** | File Browser, Terminal, ArtOS (24-tool paint suite), MusiKey, Notes, PVE Encrypt, and more |
 | **AI Governor v4** | Behavioral learning, anomaly detection, threat timeline, quarantine system |
 | **PVE-SBC encryption** | AES Rijndael S-box + CBC block chaining + LCG key stream generation |
 | **GPU HAL** | Intel BLT, VirtIO GPU, VMware SVGA II, Bochs VGA, software fallback |
@@ -97,7 +97,7 @@ phantomos/
 | **Files** | File Browser |
 | **Security** | DNAuth, LifeAuth, BioSense, Governor, Constitution, PVE Encrypt |
 | **Network** | QRNet, Network |
-| **Media** | ArtOS (paint + AI art + DrawNet), MusiKey, Media Player, PhantomPods |
+| **Media** | ArtOS (24-tool paint + AI art + DrawNet), MusiKey, Media Player, PhantomPods |
 | **Tools** | Terminal, Notes, Backup, Desktop Lab, GPU Monitor |
 | **Apps** | Geology Viewer, Users |
 

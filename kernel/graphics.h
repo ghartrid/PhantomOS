@@ -86,6 +86,18 @@ void gfx_draw_rounded_rect(int x, int y, int w, int h, int radius,
 /* Draw a drop shadow behind a rectangle (reads+blends existing pixels) */
 void gfx_draw_shadow(int x, int y, int w, int h, int offset, uint8_t alpha);
 
+/* Draw a soft multi-layer shadow with rounded corners (5 layers, diffused) */
+void gfx_draw_soft_shadow(int x, int y, int w, int h, int radius);
+
+/* Fill a rounded rectangle with anti-aliased corners */
+void gfx_fill_rounded_rect_aa(int x, int y, int w, int h, int radius,
+                               uint32_t color);
+
+/* Fill a radial-style gradient (Manhattan distance approximation) */
+void gfx_fill_gradient_radial(int x, int y, int w, int h,
+                               int cx, int cy,
+                               uint32_t color_center, uint32_t color_edge);
+
 /* Draw text at integer scale (2 = each pixel becomes 2x2 block) */
 void gfx_draw_text_scaled(int x, int y, const char *str,
                           uint32_t fg, uint32_t bg, int scale);
@@ -94,8 +106,8 @@ void gfx_draw_text_scaled(int x, int y, const char *str,
  * Mouse Cursor
  *============================================================================*/
 
-#define CURSOR_WIDTH    12
-#define CURSOR_HEIGHT   19
+#define CURSOR_WIDTH    14
+#define CURSOR_HEIGHT   21
 
 /* Draw the mouse cursor at the given position */
 void gfx_draw_cursor(int x, int y);
