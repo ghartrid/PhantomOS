@@ -226,8 +226,13 @@ static int ls_count = 0;
 static int ls_callback(const struct kgeofs_dirent *entry, void *ctx)
 {
     (void)ctx;
-    char type_char = entry->is_directory ? 'd' : '-';
-    kprintf("%c %8lu  %s\n", type_char, (unsigned long)entry->size, entry->name);
+    char type_char = entry->is_directory ? 'd' :
+                     (entry->file_type == KGEOFS_TYPE_LINK) ? 'l' : '-';
+    kprintf("%c %8lu  %s", type_char, (unsigned long)entry->size, entry->name);
+    if (entry->file_type == KGEOFS_TYPE_LINK) {
+        kprintf(" -> (symlink)");
+    }
+    kprintf("\n");
     ls_count++;
     return 0;  /* Continue listing */
 }
@@ -423,17 +428,39 @@ static shell_result_t cmd_stat(int argc, char *argv[])
     build_path(argv[1], path, sizeof(path));
 
     uint64_t size;
-    int is_dir;
-    kgeofs_error_t err = kgeofs_file_stat(shell_volume, path, &size, &is_dir);
+    int is_dir, link_count;
+    uint8_t file_type, permissions;
+    uint16_t owner_id;
+    kgeofs_time_t created;
+    kgeofs_error_t err = kgeofs_file_stat_full(shell_volume, path,
+                                                &size, &is_dir, &file_type,
+                                                &permissions, &owner_id,
+                                                &created, &link_count);
     if (err != KGEOFS_OK) {
         kprintf("stat: Cannot stat %s\n", path);
         return SHELL_ERR_IO;
     }
 
-    kprintf("  Path: %s\n", path);
-    kprintf("  Type: %s\n", is_dir ? "directory" : "file");
-    kprintf("  Size: %lu bytes\n", (unsigned long)size);
-    kprintf("  View: %lu\n", (unsigned long)kgeofs_view_current(shell_volume));
+    const char *type_str = is_dir ? "directory" : "file";
+    if (file_type == KGEOFS_TYPE_LINK) type_str = "symlink";
+
+    kprintf("  Path:  %s\n", path);
+    kprintf("  Type:  %s\n", type_str);
+    kprintf("  Size:  %lu bytes\n", (unsigned long)size);
+    kprintf("  Links: %d\n", link_count);
+    kprintf("  Perms: %c%c%c\n",
+            (permissions & KGEOFS_PERM_READ) ? 'r' : '-',
+            (permissions & KGEOFS_PERM_WRITE) ? 'w' : '-',
+            (permissions & KGEOFS_PERM_EXEC) ? 'x' : '-');
+    kprintf("  Owner: %u\n", (unsigned)owner_id);
+    kprintf("  View:  %lu\n", (unsigned long)kgeofs_view_current(shell_volume));
+
+    if (file_type == KGEOFS_TYPE_LINK) {
+        char target[KGEOFS_MAX_PATH];
+        if (kgeofs_readlink(shell_volume, path, target, sizeof(target)) == KGEOFS_OK) {
+            kprintf("  Target: %s\n", target);
+        }
+    }
 
     return SHELL_OK;
 }
@@ -780,6 +807,106 @@ static shell_result_t cmd_find(int argc, char *argv[])
     int count = kgeofs_file_find(shell_volume, start, argv[1],
                                   find_print_cb, NULL);
     kprintf("\n%d matches\n", count);
+    return SHELL_OK;
+}
+
+/* grep - Search file contents */
+static int grep_print_cb(const char *path, int line_num,
+                          const char *line, void *ctx)
+{
+    (void)ctx;
+    kprintf("  %s:%d: %s\n", path, line_num, line);
+    return 0;
+}
+
+static shell_result_t cmd_grep(int argc, char *argv[])
+{
+    if (!shell_volume) {
+        kprintf("No filesystem volume\n");
+        return SHELL_OK;
+    }
+    if (argc < 2) {
+        kprintf("Usage: grep <pattern> [path]\n");
+        return SHELL_OK;
+    }
+
+    const char *start = current_path;
+    if (argc >= 3) {
+        char path[SHELL_CMD_MAX];
+        build_path(argv[2], path, sizeof(path));
+        start = path;
+    }
+
+    kprintf("Searching for '%s' in %s:\n", argv[1], start);
+    int count = kgeofs_file_grep(shell_volume, start, argv[1], 1,
+                                  grep_print_cb, NULL);
+    kprintf("\n%d matches\n", count);
+    return SHELL_OK;
+}
+
+/* ln - Create hard or symbolic link */
+static shell_result_t cmd_ln(int argc, char *argv[])
+{
+    if (!shell_volume) {
+        kprintf("No filesystem volume\n");
+        return SHELL_OK;
+    }
+
+    int symlink = 0;
+    int arg_start = 1;
+
+    if (argc >= 2 && strcmp(argv[1], "-s") == 0) {
+        symlink = 1;
+        arg_start = 2;
+    }
+
+    if (argc < arg_start + 2) {
+        kprintf("Usage: ln [-s] <target> <linkname>\n");
+        return SHELL_OK;
+    }
+
+    char target[SHELL_CMD_MAX], linkname[SHELL_CMD_MAX];
+    build_path(argv[arg_start], target, sizeof(target));
+    build_path(argv[arg_start + 1], linkname, sizeof(linkname));
+
+    kgeofs_error_t err;
+    if (symlink) {
+        err = kgeofs_file_symlink(shell_volume, target, linkname);
+    } else {
+        err = kgeofs_file_link(shell_volume, target, linkname);
+    }
+
+    if (err != KGEOFS_OK) {
+        kprintf("ln: %s\n", kgeofs_strerror(err));
+    } else {
+        kprintf("Created %slink %s -> %s\n",
+                symlink ? "sym" : "hard", linkname, target);
+    }
+    return SHELL_OK;
+}
+
+/* readlink - Read symlink target */
+static shell_result_t cmd_readlink(int argc, char *argv[])
+{
+    if (!shell_volume) {
+        kprintf("No filesystem volume\n");
+        return SHELL_OK;
+    }
+    if (argc < 2) {
+        kprintf("Usage: readlink <path>\n");
+        return SHELL_OK;
+    }
+
+    char path[SHELL_CMD_MAX];
+    build_path(argv[1], path, sizeof(path));
+
+    char target[KGEOFS_MAX_PATH];
+    kgeofs_error_t err = kgeofs_readlink(shell_volume, path, target, sizeof(target));
+    if (err != KGEOFS_OK) {
+        kprintf("readlink: %s\n", kgeofs_strerror(err));
+    } else {
+        kprintf("%s\n", target);
+    }
     return SHELL_OK;
 }
 
@@ -1367,6 +1494,9 @@ static const shell_cmd_t commands[] = {
     { "cp",       cmd_cp,       "Copy file (zero-copy)" },
     { "tree",     cmd_tree,     "Recursive directory listing" },
     { "find",     cmd_find,     "Search files by name" },
+    { "grep",     cmd_grep,     "Search file contents" },
+    { "ln",       cmd_ln,       "Create hard/symlink (ln [-s])" },
+    { "readlink", cmd_readlink, "Read symlink target" },
     { "chmod",    cmd_chmod,    "Set file permissions" },
     { "chown",    cmd_chown,    "Set file owner" },
 
@@ -1446,8 +1576,9 @@ void shell_help(void)
             strcmp(cmd->name, "pwd") == 0 || strcmp(cmd->name, "cd") == 0 ||
             strcmp(cmd->name, "stat") == 0 || strcmp(cmd->name, "mv") == 0 ||
             strcmp(cmd->name, "cp") == 0 || strcmp(cmd->name, "tree") == 0 ||
-            strcmp(cmd->name, "find") == 0 || strcmp(cmd->name, "chmod") == 0 ||
-            strcmp(cmd->name, "chown") == 0) {
+            strcmp(cmd->name, "find") == 0 || strcmp(cmd->name, "grep") == 0 ||
+            strcmp(cmd->name, "ln") == 0 || strcmp(cmd->name, "readlink") == 0 ||
+            strcmp(cmd->name, "chmod") == 0 || strcmp(cmd->name, "chown") == 0) {
             kprintf("  %-10s %s\n", cmd->name, cmd->description);
         }
     }

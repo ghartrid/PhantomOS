@@ -74,6 +74,7 @@ typedef enum {
     KGEOFS_ERR_PERM     = -10,  /* Permission denied */
     KGEOFS_ERR_QUOTA    = -11,  /* Quota exceeded */
     KGEOFS_ERR_CONFLICT = -12,  /* Merge conflict */
+    KGEOFS_ERR_SYMLOOP  = -13,  /* Symlink loop detected */
 } kgeofs_error_t;
 
 /* Hash type (SHA-256) */
@@ -129,7 +130,13 @@ struct kgeofs_content_entry {
 /* File type */
 #define KGEOFS_TYPE_FILE    0
 #define KGEOFS_TYPE_DIR     1
-#define KGEOFS_TYPE_LINK    2
+#define KGEOFS_TYPE_LINK    2       /* Symbolic link */
+
+/* Symlink constants */
+#define KGEOFS_SYMLINK_MAX_HOPS 8
+
+/* Content flags */
+#define KGEOFS_CONTENT_FLAG_COMPRESSED  0x01
 
 /* Reference record (stored in ref region) */
 struct kgeofs_ref_record {
@@ -160,7 +167,8 @@ struct kgeofs_ref_entry {
     uint8_t                     file_type;      /* KGEOFS_TYPE_* */
     uint8_t                     permissions;    /* KGEOFS_PERM_* */
     uint16_t                    owner_id;
-    struct kgeofs_ref_entry    *next;
+    struct kgeofs_ref_entry    *next;       /* Full list chain */
+    struct kgeofs_ref_entry    *hash_next;  /* ref_hash bucket chain */
 };
 
 /* View record (stored in view region) */
@@ -266,6 +274,7 @@ struct kgeofs_volume {
     /* In-memory indices */
     struct kgeofs_content_entry *content_hash[KGEOFS_HASH_BUCKETS];
     struct kgeofs_ref_entry    *ref_index;
+    struct kgeofs_ref_entry    *ref_hash[KGEOFS_HASH_BUCKETS]; /* O(1) path lookup */
     struct kgeofs_view_entry   *view_index;
     struct kgeofs_branch_entry *branch_index;
     struct kgeofs_quota_entry  *quota_index;
@@ -290,6 +299,8 @@ struct kgeofs_volume {
     uint64_t                    total_branches;
     uint64_t                    dedup_hits;
     uint64_t                    total_lookups;
+    uint64_t                    compressed_bytes;   /* Bytes saved by compression */
+    uint64_t                    compressed_count;   /* Compressed content blocks */
 };
 
 /* Statistics structure for external queries */
@@ -305,6 +316,8 @@ struct kgeofs_stats {
     uint64_t    view_region_used;
     uint64_t    dedup_hits;
     uint64_t    current_view;
+    uint64_t    compressed_bytes;   /* Bytes saved by LZ4 compression */
+    uint64_t    compressed_count;   /* Number of compressed content blocks */
 };
 
 /* Directory entry for listing */
@@ -316,6 +329,7 @@ struct kgeofs_dirent {
     kgeofs_time_t   created;
     uint8_t         permissions;
     uint16_t        owner_id;
+    uint8_t         file_type;      /* KGEOFS_TYPE_* */
 };
 
 /* View diff entry */
@@ -570,6 +584,75 @@ kgeofs_error_t kgeofs_file_chmod(kgeofs_volume_t *vol,
 kgeofs_error_t kgeofs_file_chown(kgeofs_volume_t *vol,
                                   const char *path,
                                   uint16_t owner_id);
+
+/*
+ * Create a hard link (new ref to same content hash)
+ */
+kgeofs_error_t kgeofs_file_link(kgeofs_volume_t *vol,
+                                 const char *existing_path,
+                                 const char *new_path);
+
+/*
+ * Create a symbolic link (stores target path as content)
+ */
+kgeofs_error_t kgeofs_file_symlink(kgeofs_volume_t *vol,
+                                     const char *target_path,
+                                     const char *link_path);
+
+/*
+ * Read symlink target without resolving
+ */
+kgeofs_error_t kgeofs_readlink(kgeofs_volume_t *vol,
+                                const char *path,
+                                char *buf,
+                                size_t buf_size);
+
+/*
+ * Extended stat: returns file type, permissions, owner, link count
+ */
+kgeofs_error_t kgeofs_file_stat_full(kgeofs_volume_t *vol,
+                                      const char *path,
+                                      uint64_t *size_out,
+                                      int *is_dir_out,
+                                      uint8_t *file_type_out,
+                                      uint8_t *permissions_out,
+                                      uint16_t *owner_id_out,
+                                      kgeofs_time_t *created_out,
+                                      int *link_count_out);
+
+/*
+ * Full-text content search (grep)
+ * Scans visible files under dir_path for pattern matches
+ * Returns number of matches found
+ */
+typedef int (*kgeofs_grep_callback_t)(const char *path,
+                                       int line_number,
+                                       const char *line,
+                                       void *ctx);
+
+int kgeofs_file_grep(kgeofs_volume_t *vol,
+                      const char *dir_path,
+                      const char *pattern,
+                      int case_insensitive,
+                      kgeofs_grep_callback_t callback,
+                      void *ctx);
+
+/*
+ * Enhanced file find with filters
+ */
+struct kgeofs_find_filter {
+    uint64_t    min_size;       /* 0 = no min */
+    uint64_t    max_size;       /* 0 = no max */
+    uint8_t     file_type;      /* 0xFF = any type */
+    uint16_t    owner_id;       /* 0xFFFF = any owner */
+};
+
+int kgeofs_file_find_filtered(kgeofs_volume_t *vol,
+                                const char *start_path,
+                                const char *name_pattern,
+                                const struct kgeofs_find_filter *filter,
+                                kgeofs_find_callback_t callback,
+                                void *ctx);
 
 /*============================================================================
  * View Diff Functions

@@ -183,7 +183,7 @@ _start:
 
     /* Set up 32-bit stack using absolute address
      * Stack is in BSS at a known location relative to kernel base (1MB) */
-    movl $0x15e000, %esp            /* stack_top (actual address from linker) */
+    movl $0x160000, %esp            /* stack_top (actual address from linker) */
 
     /* Verify CPU capabilities */
     call check_cpuid
@@ -329,29 +329,29 @@ error_msg_lm:
  *----------------------------------------------------------------------------*/
 setup_page_tables:
     /* Page table addresses (in BSS, actual addresses from linker):
-     * pml4_table  = 0x157000
-     * pdpt_table  = 0x158000
-     * pd_table    = 0x159000
+     * pml4_table  = 0x159000
+     * pdpt_table  = 0x15a000
+     * pd_table    = 0x15b000
      */
 
     /* Zero out page tables */
-    movl $0x157000, %edi        /* pml4_table */
+    movl $0x159000, %edi        /* pml4_table */
     xorl %eax, %eax
     movl $(3 * 4096 / 4), %ecx  /* 3 tables * 4096 bytes / 4 bytes */
     rep stosl
 
     /* PML4[0] -> PDPT */
-    movl $0x158000, %eax        /* pdpt_table */
+    movl $0x15a000, %eax        /* pdpt_table */
     orl $PAGE_FLAGS, %eax
-    movl %eax, 0x157000         /* pml4_table[0] */
+    movl %eax, 0x159000         /* pml4_table[0] */
 
     /* PDPT[0] -> PD */
-    movl $0x159000, %eax        /* pd_table */
+    movl $0x15b000, %eax        /* pd_table */
     orl $PAGE_FLAGS, %eax
-    movl %eax, 0x158000         /* pdpt_table[0] */
+    movl %eax, 0x15a000         /* pdpt_table[0] */
 
     /* Fill PD with 2MB page entries (identity map first 1GB) */
-    movl $0x159000, %edi        /* pd_table */
+    movl $0x15b000, %edi        /* pd_table */
     movl $PAGE_FLAGS_HUGE, %eax /* Start at physical address 0 */
     movl $512, %ecx             /* 512 entries */
 
@@ -370,7 +370,7 @@ setup_page_tables:
  *----------------------------------------------------------------------------*/
 enable_paging:
     /* Load PML4 address into CR3 */
-    movl $0x157000, %eax        /* pml4_table (actual address from linker) */
+    movl $0x159000, %eax        /* pml4_table (actual address from linker) */
     movl %eax, %cr3
 
     /* Enable PAE (Physical Address Extension) in CR4 */
@@ -409,7 +409,7 @@ long_mode_entry:
     movw %ax, %ss
 
     /* Set up 64-bit stack */
-    movq $0x15e000, %rsp        /* stack_top (actual address from linker) */
+    movq $0x160000, %rsp        /* stack_top (actual address from linker) */
 
     /* Now we can safely store multiboot info using RIP-relative addressing */
     /* ESI = magic (from 32-bit code), EDI = info pointer (from 32-bit code) */

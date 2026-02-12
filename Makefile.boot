@@ -116,7 +116,8 @@ KERNEL_SRCS = kernel/kmain.c \
               kernel/kvm_clock.c \
               kernel/virtio_console.c \
               kernel/acpi.c \
-              kernel/virtio_net.c
+              kernel/virtio_net.c \
+              kernel/lz4.c
 
 # Kernel assembly sources
 KERNEL_ASM_SRCS = kernel/context_switch.S

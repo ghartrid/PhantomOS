@@ -10,6 +10,7 @@
 #include "pmm.h"
 #include "heap.h"
 #include "ata.h"
+#include "lz4.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -27,6 +28,8 @@ extern char *strcpy(char *dest, const char *src);
 extern int strcmp(const char *s1, const char *s2);
 extern int strncmp(const char *s1, const char *s2, size_t n);
 extern char *strncpy(char *dest, const char *src, size_t n);
+extern char *strchr(const char *s, int c);
+extern char *strstr(const char *haystack, const char *needle);
 
 /* Timer for timestamps */
 extern uint64_t timer_get_ticks(void);
@@ -177,6 +180,7 @@ const char *kgeofs_strerror(kgeofs_error_t err)
         case KGEOFS_ERR_PERM:   return "Permission denied";
         case KGEOFS_ERR_QUOTA:  return "Quota exceeded";
         case KGEOFS_ERR_CONFLICT: return "Merge conflict";
+        case KGEOFS_ERR_SYMLOOP: return "Symlink loop detected";
         default:                return "Unknown error";
     }
 }
@@ -452,6 +456,8 @@ void kgeofs_volume_stats(kgeofs_volume_t *vol, struct kgeofs_stats *stats)
 
     stats->dedup_hits = vol->dedup_hits;
     stats->current_view = vol->current_view;
+    stats->compressed_bytes = vol->compressed_bytes;
+    stats->compressed_count = vol->compressed_count;
 }
 
 /*============================================================================
@@ -495,14 +501,31 @@ kgeofs_error_t kgeofs_content_store(kgeofs_volume_t *vol,
         return KGEOFS_OK;
     }
 
-    /* Calculate space needed */
+    /* Try LZ4 compression for blocks >= 64 bytes */
     size_t header_size = sizeof(struct kgeofs_content_header);
-    size_t total_size = header_size + size;
+    uint8_t *compressed_buf = NULL;
+    size_t compressed_len = 0;
+    int use_compression = 0;
+
+    if (size >= 64) {
+        compressed_buf = kmalloc(size);
+        if (compressed_buf) {
+            if (lz4_compress((const uint8_t *)data, size,
+                             compressed_buf, size, &compressed_len) == 0 &&
+                compressed_len < (size * 9) / 10) {
+                use_compression = 1;
+            }
+        }
+    }
+
+    size_t store_size = use_compression ? compressed_len : size;
+    size_t total_size = header_size + store_size;
 
     /* Find space or auto-grow */
     struct kgeofs_ram_region *region = region_find_or_grow(
         vol->content_region, total_size);
     if (!region) {
+        if (compressed_buf) kfree(compressed_buf);
         return KGEOFS_ERR_FULL;
     }
 
@@ -510,20 +533,29 @@ kgeofs_error_t kgeofs_content_store(kgeofs_volume_t *vol,
     struct kgeofs_content_header *hdr =
         (struct kgeofs_content_header *)((uint8_t *)region->base + region->used);
     hdr->magic = KGEOFS_CONTENT_MAGIC;
-    hdr->flags = 0;
-    hdr->size = size;
+    hdr->flags = use_compression ? KGEOFS_CONTENT_FLAG_COMPRESSED : 0;
+    hdr->size = store_size;
     memcpy(hdr->hash, hash, KGEOFS_HASH_SIZE);
     memset(hdr->reserved, 0, sizeof(hdr->reserved));
 
-    /* Write data */
-    memcpy((uint8_t *)hdr + header_size, data, size);
+    /* Store original size in reserved[0..7] when compressed */
+    if (use_compression) {
+        uint64_t orig_size = (uint64_t)size;
+        memcpy(hdr->reserved, &orig_size, sizeof(orig_size));
+    }
 
-    /* Add to index */
+    /* Write data */
+    memcpy((uint8_t *)hdr + header_size,
+           use_compression ? compressed_buf : data, store_size);
+
+    if (compressed_buf) kfree(compressed_buf);
+
+    /* Add to index (size = decompressed size for correct reporting) */
     struct kgeofs_content_entry *entry = kmalloc(sizeof(*entry));
     if (entry) {
         memcpy(entry->hash, hash, KGEOFS_HASH_SIZE);
         entry->offset = region->used;
-        entry->size = size;
+        entry->size = size;  /* Always report decompressed size */
 
         uint8_t bucket = KGEOFS_HASH_BUCKET(hash);
         entry->next = vol->content_hash[bucket];
@@ -532,6 +564,11 @@ kgeofs_error_t kgeofs_content_store(kgeofs_volume_t *vol,
 
     region->used += total_size;
     vol->total_content_bytes += size;
+
+    if (use_compression) {
+        vol->compressed_bytes += (size - compressed_len);
+        vol->compressed_count++;
+    }
 
     memcpy(hash_out, hash, KGEOFS_HASH_SIZE);
     return KGEOFS_OK;
@@ -567,18 +604,42 @@ kgeofs_error_t kgeofs_content_read(kgeofs_volume_t *vol,
         return KGEOFS_ERR_CORRUPT;
     }
 
-    /* Read data (skip header) */
-    size_t to_read = entry->size;
-    if (to_read > buf_size) {
-        to_read = buf_size;
-    }
-
+    /* Read data (skip header) — decompress if needed */
     struct kgeofs_content_header *hdr =
         (struct kgeofs_content_header *)((uint8_t *)region->base + offset);
-    memcpy(buf, (uint8_t *)hdr + sizeof(*hdr), to_read);
 
-    if (size_out) {
-        *size_out = entry->size;
+    if (hdr->flags & KGEOFS_CONTENT_FLAG_COMPRESSED) {
+        /* Compressed: read original size from reserved[0..7] */
+        uint64_t original_size;
+        memcpy(&original_size, hdr->reserved, sizeof(original_size));
+
+        size_t compressed_size = (size_t)hdr->size;
+        const uint8_t *compressed_data = (uint8_t *)hdr + sizeof(*hdr);
+
+        uint8_t *decomp_buf = kmalloc((size_t)original_size);
+        if (!decomp_buf) return KGEOFS_ERR_NOMEM;
+
+        size_t decompressed_len;
+        if (lz4_decompress(compressed_data, compressed_size,
+                            decomp_buf, (size_t)original_size,
+                            &decompressed_len) != 0) {
+            kfree(decomp_buf);
+            return KGEOFS_ERR_CORRUPT;
+        }
+
+        size_t to_read = decompressed_len;
+        if (to_read > buf_size) to_read = buf_size;
+        memcpy(buf, decomp_buf, to_read);
+        kfree(decomp_buf);
+
+        if (size_out) *size_out = decompressed_len;
+    } else {
+        /* Uncompressed: direct copy */
+        size_t to_read = entry->size;
+        if (to_read > buf_size) to_read = buf_size;
+        memcpy(buf, (uint8_t *)hdr + sizeof(*hdr), to_read);
+
+        if (size_out) *size_out = entry->size;
     }
 
     return KGEOFS_OK;
@@ -648,6 +709,14 @@ static int view_in_ancestry(kgeofs_volume_t *vol, kgeofs_view_t view_id)
     return 0;
 }
 
+/* Insert ref entry into hash table for O(1) path lookups */
+static void ref_hash_insert(kgeofs_volume_t *vol, struct kgeofs_ref_entry *entry)
+{
+    uint8_t bucket = KGEOFS_HASH_BUCKET(entry->path_hash);
+    entry->hash_next = vol->ref_hash[bucket];
+    vol->ref_hash[bucket] = entry;
+}
+
 /* Find best matching ref for path in current view (branch-aware) */
 static struct kgeofs_ref_entry *ref_find_best(kgeofs_volume_t *vol,
                                                const char *path)
@@ -658,10 +727,11 @@ static struct kgeofs_ref_entry *ref_find_best(kgeofs_volume_t *vol,
     struct kgeofs_ref_entry *best = NULL;
     kgeofs_time_t best_time = 0;
 
-    struct kgeofs_ref_entry *entry = vol->ref_index;
+    /* Use ref_hash for O(1) bucket lookup instead of scanning ref_index */
+    uint8_t bucket = KGEOFS_HASH_BUCKET(path_hash);
+    struct kgeofs_ref_entry *entry = vol->ref_hash[bucket];
     while (entry) {
         if (kgeofs_hash_equal(entry->path_hash, path_hash)) {
-            /* Check if visible via ancestry chain */
             if (view_in_ancestry(vol, entry->view_id)) {
                 if (entry->created > best_time) {
                     best = entry;
@@ -669,7 +739,7 @@ static struct kgeofs_ref_entry *ref_find_best(kgeofs_volume_t *vol,
                 }
             }
         }
-        entry = entry->next;
+        entry = entry->hash_next;
     }
 
     return best;
@@ -725,9 +795,11 @@ kgeofs_error_t kgeofs_ref_create(kgeofs_volume_t *vol,
         entry->file_type = KGEOFS_TYPE_FILE;
         entry->permissions = KGEOFS_PERM_DEFAULT;
         entry->owner_id = 0;
+        entry->hash_next = NULL;
 
         entry->next = vol->ref_index;
         vol->ref_index = entry;
+        ref_hash_insert(vol, entry);
     }
 
     region->used += record_size;
@@ -744,13 +816,34 @@ kgeofs_error_t kgeofs_ref_resolve(kgeofs_volume_t *vol,
         return KGEOFS_ERR_INVALID;
     }
 
-    struct kgeofs_ref_entry *entry = ref_find_best(vol, path);
-    if (!entry || entry->is_hidden) {
-        return KGEOFS_ERR_NOTFOUND;
+    const char *current_path = path;
+    char resolved_buf[KGEOFS_MAX_PATH];
+    int hops = 0;
+
+    while (hops < KGEOFS_SYMLINK_MAX_HOPS) {
+        struct kgeofs_ref_entry *entry = ref_find_best(vol, current_path);
+        if (!entry || entry->is_hidden) {
+            return KGEOFS_ERR_NOTFOUND;
+        }
+
+        if (entry->file_type != KGEOFS_TYPE_LINK) {
+            memcpy(hash_out, entry->content_hash, KGEOFS_HASH_SIZE);
+            return KGEOFS_OK;
+        }
+
+        /* Symlink: read target path from content */
+        size_t got;
+        kgeofs_error_t err = kgeofs_content_read(vol, entry->content_hash,
+                                                   resolved_buf,
+                                                   KGEOFS_MAX_PATH - 1, &got);
+        if (err != KGEOFS_OK) return err;
+        resolved_buf[got] = '\0';
+
+        current_path = resolved_buf;
+        hops++;
     }
 
-    memcpy(hash_out, entry->content_hash, KGEOFS_HASH_SIZE);
-    return KGEOFS_OK;
+    return KGEOFS_ERR_SYMLOOP;
 }
 
 int kgeofs_ref_list(kgeofs_volume_t *vol,
@@ -799,6 +892,7 @@ int kgeofs_ref_list(kgeofs_volume_t *vol,
                     dirent.created = entry->created;
                     dirent.permissions = entry->permissions;
                     dirent.owner_id = entry->owner_id;
+                    dirent.file_type = entry->file_type;
 
                     /* Check if directory */
                     uint64_t size;
@@ -1632,6 +1726,7 @@ static int tree_recurse(kgeofs_volume_t *vol, const char *dir_path,
                     dirent.created = entry->created;
                     dirent.permissions = entry->permissions;
                     dirent.owner_id = entry->owner_id;
+                    dirent.file_type = entry->file_type;
 
                     /* Check if directory */
                     uint64_t size;
@@ -1730,6 +1825,356 @@ int kgeofs_file_find(kgeofs_volume_t *vol,
                         return count;
                     count++;
                 }
+            }
+        }
+        entry = entry->next;
+    }
+    return count;
+}
+
+/*============================================================================
+ * Symlinks & Hardlinks
+ *============================================================================*/
+
+/* Internal: create a ref with explicit type/permissions/owner */
+static kgeofs_error_t ref_create_typed(kgeofs_volume_t *vol,
+                                        const char *path,
+                                        const kgeofs_hash_t content_hash,
+                                        uint8_t file_type,
+                                        uint8_t permissions,
+                                        uint16_t owner_id)
+{
+    if (!vol || !path || !content_hash) return KGEOFS_ERR_INVALID;
+
+    size_t path_len = strlen(path);
+    if (path_len >= KGEOFS_MAX_PATH) return KGEOFS_ERR_INVALID;
+
+    size_t record_size = sizeof(struct kgeofs_ref_record);
+    struct kgeofs_ram_region *region = region_find_or_grow(
+        vol->ref_region, record_size);
+    if (!region) return KGEOFS_ERR_FULL;
+
+    struct kgeofs_ref_record *record =
+        (struct kgeofs_ref_record *)((uint8_t *)region->base + region->used);
+
+    record->magic = KGEOFS_REF_MAGIC;
+    record->flags = 0;
+    hash_path(path, record->path_hash);
+    memcpy(record->content_hash, content_hash, KGEOFS_HASH_SIZE);
+    record->view_id = vol->current_view;
+    record->created = kgeofs_time_now();
+    record->path_len = path_len;
+    record->file_type = file_type;
+    record->permissions = permissions;
+    record->owner_id = owner_id;
+    record->reserved_pad = 0;
+    strcpy(record->path, path);
+
+    struct kgeofs_ref_entry *entry = kmalloc(sizeof(*entry));
+    if (entry) {
+        memcpy(entry->path_hash, record->path_hash, KGEOFS_HASH_SIZE);
+        memcpy(entry->content_hash, content_hash, KGEOFS_HASH_SIZE);
+        entry->view_id = record->view_id;
+        entry->created = record->created;
+        strcpy(entry->path, path);
+        entry->is_hidden = 0;
+        entry->file_type = file_type;
+        entry->permissions = permissions;
+        entry->owner_id = owner_id;
+        entry->hash_next = NULL;
+
+        entry->next = vol->ref_index;
+        vol->ref_index = entry;
+        ref_hash_insert(vol, entry);
+    }
+
+    region->used += record_size;
+    vol->total_refs++;
+    return KGEOFS_OK;
+}
+
+/* Count visible refs sharing the same content hash (link count) */
+static int count_links(kgeofs_volume_t *vol, const kgeofs_hash_t content_hash)
+{
+    int count = 0;
+    struct kgeofs_ref_entry *entry = vol->ref_index;
+    while (entry) {
+        if (!entry->is_hidden &&
+            view_in_ancestry(vol, entry->view_id) &&
+            entry->file_type != KGEOFS_TYPE_LINK &&
+            kgeofs_hash_equal(entry->content_hash, content_hash)) {
+            count++;
+        }
+        entry = entry->next;
+    }
+    return count;
+}
+
+kgeofs_error_t kgeofs_file_link(kgeofs_volume_t *vol,
+                                 const char *existing_path,
+                                 const char *new_path)
+{
+    if (!vol || !existing_path || !new_path) return KGEOFS_ERR_INVALID;
+
+    struct kgeofs_ref_entry *src = ref_find_best(vol, existing_path);
+    if (!src || src->is_hidden) return KGEOFS_ERR_NOTFOUND;
+    if (src->file_type == KGEOFS_TYPE_LINK) return KGEOFS_ERR_INVALID;
+
+    kgeofs_error_t perr = check_permission(vol, src, KGEOFS_PERM_READ);
+    if (perr != KGEOFS_OK) return perr;
+
+    /* Check dest does not exist */
+    struct kgeofs_ref_entry *dst = ref_find_best(vol, new_path);
+    if (dst && !dst->is_hidden) return KGEOFS_ERR_EXISTS;
+
+    return ref_create_typed(vol, new_path, src->content_hash,
+                            src->file_type, src->permissions, src->owner_id);
+}
+
+kgeofs_error_t kgeofs_file_symlink(kgeofs_volume_t *vol,
+                                     const char *target_path,
+                                     const char *link_path)
+{
+    if (!vol || !target_path || !link_path) return KGEOFS_ERR_INVALID;
+
+    /* Check link_path does not already exist */
+    struct kgeofs_ref_entry *existing = ref_find_best(vol, link_path);
+    if (existing && !existing->is_hidden) return KGEOFS_ERR_EXISTS;
+
+    /* Store target path string as content */
+    size_t target_len = strlen(target_path);
+    kgeofs_hash_t hash;
+    kgeofs_error_t err = kgeofs_content_store(vol, target_path, target_len, hash);
+    if (err != KGEOFS_OK) return err;
+
+    return ref_create_typed(vol, link_path, hash,
+                            KGEOFS_TYPE_LINK, KGEOFS_PERM_DEFAULT,
+                            vol->current_ctx.uid);
+}
+
+kgeofs_error_t kgeofs_readlink(kgeofs_volume_t *vol,
+                                const char *path,
+                                char *buf,
+                                size_t buf_size)
+{
+    if (!vol || !path || !buf) return KGEOFS_ERR_INVALID;
+
+    struct kgeofs_ref_entry *entry = ref_find_best(vol, path);
+    if (!entry || entry->is_hidden) return KGEOFS_ERR_NOTFOUND;
+    if (entry->file_type != KGEOFS_TYPE_LINK) return KGEOFS_ERR_INVALID;
+
+    size_t got;
+    kgeofs_error_t err = kgeofs_content_read(vol, entry->content_hash,
+                                              buf, buf_size - 1, &got);
+    if (err != KGEOFS_OK) return err;
+    buf[got] = '\0';
+    return KGEOFS_OK;
+}
+
+kgeofs_error_t kgeofs_file_stat_full(kgeofs_volume_t *vol,
+                                      const char *path,
+                                      uint64_t *size_out,
+                                      int *is_dir_out,
+                                      uint8_t *file_type_out,
+                                      uint8_t *permissions_out,
+                                      uint16_t *owner_id_out,
+                                      kgeofs_time_t *created_out,
+                                      int *link_count_out)
+{
+    if (!vol || !path) return KGEOFS_ERR_INVALID;
+
+    struct kgeofs_ref_entry *entry = ref_find_best(vol, path);
+    if (!entry || entry->is_hidden) return KGEOFS_ERR_NOTFOUND;
+
+    if (file_type_out) *file_type_out = entry->file_type;
+    if (permissions_out) *permissions_out = entry->permissions;
+    if (owner_id_out) *owner_id_out = entry->owner_id;
+    if (created_out) *created_out = entry->created;
+
+    /* For symlinks, stat the target */
+    if (entry->file_type == KGEOFS_TYPE_LINK) {
+        if (is_dir_out) *is_dir_out = 0;
+        if (size_out) {
+            kgeofs_content_size(vol, entry->content_hash, size_out);
+        }
+        if (link_count_out) *link_count_out = 1;
+        return KGEOFS_OK;
+    }
+
+    uint64_t sz = 0;
+    kgeofs_content_size(vol, entry->content_hash, &sz);
+    if (size_out) *size_out = sz;
+
+    int is_dir = (entry->file_type == KGEOFS_TYPE_DIR);
+    if (!is_dir && sz == KGEOFS_DIR_MARKER_LEN) {
+        char marker[KGEOFS_DIR_MARKER_LEN + 1];
+        size_t got;
+        if (kgeofs_content_read(vol, entry->content_hash,
+                                marker, sizeof(marker), &got) == KGEOFS_OK) {
+            marker[got] = '\0';
+            if (strcmp(marker, KGEOFS_DIR_MARKER) == 0) is_dir = 1;
+        }
+    }
+    if (is_dir_out) *is_dir_out = is_dir;
+
+    if (link_count_out) *link_count_out = count_links(vol, entry->content_hash);
+
+    return KGEOFS_OK;
+}
+
+/*============================================================================
+ * Full-Text Content Search (grep)
+ *============================================================================*/
+
+int kgeofs_file_grep(kgeofs_volume_t *vol,
+                      const char *dir_path,
+                      const char *pattern,
+                      int case_insensitive,
+                      kgeofs_grep_callback_t callback,
+                      void *ctx)
+{
+    if (!vol || !pattern || !callback) return 0;
+
+    size_t dir_len = dir_path ? strlen(dir_path) : 0;
+    int match_count = 0;
+
+    struct kgeofs_ref_entry *entry = vol->ref_index;
+    while (entry) {
+        if (!view_in_ancestry(vol, entry->view_id) || entry->is_hidden ||
+            entry->file_type == KGEOFS_TYPE_DIR ||
+            entry->file_type == KGEOFS_TYPE_LINK) {
+            entry = entry->next;
+            continue;
+        }
+
+        /* Check if under dir_path */
+        if (dir_path && dir_len > 0) {
+            if (strncmp(entry->path, dir_path, dir_len) != 0) {
+                entry = entry->next;
+                continue;
+            }
+        }
+
+        /* Read file content (limit to 64KB) */
+        uint64_t file_size;
+        if (kgeofs_content_size(vol, entry->content_hash, &file_size) != KGEOFS_OK ||
+            file_size == 0 || file_size > 65536) {
+            entry = entry->next;
+            continue;
+        }
+
+        uint8_t *buf = kmalloc((size_t)file_size + 1);
+        if (!buf) { entry = entry->next; continue; }
+
+        size_t got;
+        if (kgeofs_content_read(vol, entry->content_hash,
+                                buf, (size_t)file_size, &got) != KGEOFS_OK) {
+            kfree(buf);
+            entry = entry->next;
+            continue;
+        }
+        buf[got] = '\0';
+
+        /* Scan line by line */
+        int line_num = 1;
+        char *line_start = (char *)buf;
+        for (size_t i = 0; i <= got; i++) {
+            if (i == got || buf[i] == '\n') {
+                char saved = buf[i];
+                buf[i] = '\0';
+
+                int match;
+                if (case_insensitive)
+                    match = geofs_str_contains_ci(line_start, pattern);
+                else
+                    match = (strstr(line_start, pattern) != NULL);
+
+                if (match) {
+                    if (callback(entry->path, line_num, line_start, ctx) != 0) {
+                        kfree(buf);
+                        return match_count;
+                    }
+                    match_count++;
+                }
+
+                buf[i] = saved;
+                line_start = (char *)buf + i + 1;
+                line_num++;
+            }
+        }
+
+        kfree(buf);
+        entry = entry->next;
+    }
+
+    return match_count;
+}
+
+/*============================================================================
+ * Enhanced File Find with Filters
+ *============================================================================*/
+
+int kgeofs_file_find_filtered(kgeofs_volume_t *vol,
+                                const char *start_path,
+                                const char *name_pattern,
+                                const struct kgeofs_find_filter *filter,
+                                kgeofs_find_callback_t callback,
+                                void *ctx)
+{
+    if (!vol || !callback) return 0;
+
+    size_t start_len = start_path ? strlen(start_path) : 0;
+    int count = 0;
+
+    struct kgeofs_ref_entry *entry = vol->ref_index;
+    while (entry) {
+        if (view_in_ancestry(vol, entry->view_id) && !entry->is_hidden) {
+            int under = 1;
+            if (start_path && start_len > 0) {
+                if (strncmp(entry->path, start_path, start_len) != 0)
+                    under = 0;
+            }
+
+            if (under) {
+                /* Name pattern match (if provided) */
+                if (name_pattern && name_pattern[0]) {
+                    const char *name = entry->path;
+                    const char *p = entry->path;
+                    while (*p) { if (*p == '/') name = p + 1; p++; }
+                    if (!geofs_str_contains_ci(name, name_pattern)) {
+                        entry = entry->next;
+                        continue;
+                    }
+                }
+
+                /* Apply filters */
+                if (filter) {
+                    uint64_t size = 0;
+                    kgeofs_content_size(vol, entry->content_hash, &size);
+
+                    if (filter->min_size > 0 && size < filter->min_size) {
+                        entry = entry->next; continue;
+                    }
+                    if (filter->max_size > 0 && size > filter->max_size) {
+                        entry = entry->next; continue;
+                    }
+                    if (filter->file_type != 0xFF &&
+                        entry->file_type != filter->file_type) {
+                        entry = entry->next; continue;
+                    }
+                    if (filter->owner_id != 0xFFFF &&
+                        entry->owner_id != filter->owner_id) {
+                        entry = entry->next; continue;
+                    }
+                }
+
+                uint64_t size = 0;
+                kgeofs_content_size(vol, entry->content_hash, &size);
+                int is_dir = (entry->file_type == KGEOFS_TYPE_DIR);
+
+                if (callback(entry->path, size, is_dir, ctx) != 0)
+                    return count;
+                count++;
             }
         }
         entry = entry->next;
@@ -2058,7 +2503,15 @@ static kgeofs_error_t rebuild_indices(kgeofs_volume_t *vol)
                 if (entry) {
                     memcpy(entry->hash, hdr->hash, KGEOFS_HASH_SIZE);
                     entry->offset = pos;
-                    entry->size = hdr->size;
+
+                    /* For compressed content, report decompressed size */
+                    if (hdr->flags & KGEOFS_CONTENT_FLAG_COMPRESSED) {
+                        uint64_t original_size;
+                        memcpy(&original_size, hdr->reserved, sizeof(original_size));
+                        entry->size = original_size;
+                    } else {
+                        entry->size = hdr->size;
+                    }
 
                     uint8_t bucket = KGEOFS_HASH_BUCKET(entry->hash);
                     entry->next = vol->content_hash[bucket];
@@ -2096,9 +2549,11 @@ static kgeofs_error_t rebuild_indices(kgeofs_volume_t *vol)
                     entry->file_type = rec->file_type;
                     entry->permissions = rec->permissions;
                     entry->owner_id = rec->owner_id;
+                    entry->hash_next = NULL;
 
                     entry->next = vol->ref_index;
                     vol->ref_index = entry;
+                    ref_hash_insert(vol, entry);
                 }
 
                 pos += sizeof(struct kgeofs_ref_record);
