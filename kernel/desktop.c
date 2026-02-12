@@ -33,6 +33,9 @@
 #include "acpi.h"
 #include "vm_detect.h"
 #include "virtio_net.h"
+#include "ata.h"
+#include "virtio_console.h"
+#include "io.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -50,6 +53,9 @@ extern int strncmp(const char *s1, const char *s2, size_t n);
 extern char *strncpy(char *dest, const char *src, size_t n);
 extern char *strcpy(char *dest, const char *src);
 extern char *strrchr(const char *s, int c);
+extern char *strchr(const char *s, int c);
+extern char *strcat(char *dest, const char *src);
+extern unsigned long strtoul(const char *nptr, char **endptr, int base);
 
 /* kprintf capture hook (defined in freestanding/stdio.c) */
 extern char *kprintf_capture_buf;
@@ -294,17 +300,19 @@ static struct {
 #define ARTOS_MAX_OPACITY   255
 #define ARTOS_OPACITY_STEP  16
 
-/* Layout constants */
-#define ARTOS_TOOLBAR_H     132
-#define ARTOS_PALETTE_H     44
-#define ARTOS_LAYER_PANEL_W 60
+/* Layout constants — v4 sidebar layout */
+#define ARTOS_TOPBAR_H      26
+#define ARTOS_SIDEBAR_W     88
+#define ARTOS_BOTTOMBAR_H   54
+#define ARTOS_LAYER_PANEL_W 72
 #define ARTOS_MARGIN        8
-#define ARTOS_BTN_W         44
 #define ARTOS_BTN_H         18
-#define ARTOS_BTN_GAP       2
-#define ARTOS_HUE_BAR_W     128
+#define ARTOS_TBTN_W        84
+#define ARTOS_TBTN_H        16
+#define ARTOS_TBTN_GAP      1
+#define ARTOS_HUE_BAR_W     160
 #define ARTOS_HUE_BAR_H     12
-#define ARTOS_SV_BOX_SIZE   32
+#define ARTOS_SV_BOX_SIZE   44
 
 /* Tool types */
 #define ARTOS_TOOL_PENCIL   0
@@ -331,13 +339,18 @@ static struct {
 #define ARTOS_TOOL_PATBRUSH 21
 #define ARTOS_TOOL_CLONE    22
 #define ARTOS_TOOL_SMUDGE   23
-#define ARTOS_TOOL_COUNT    24
+#define ARTOS_TOOL_FILLOVAL 24
+#define ARTOS_TOOL_FILLSTAR 25
+#define ARTOS_TOOL_SPIRAL   26
+#define ARTOS_TOOL_BLUR     27
+#define ARTOS_TOOL_COUNT    28
 
 static const char *artos_tool_names[ARTOS_TOOL_COUNT] = {
-    "Pencil", "Line", "Rect", "FillR", "Ellip", "Fill",
-    "Erase", "Pick", "Text", "Poly", "Spray", "Select",
-    "RndRc", "Circl", "Star", "Arrow", "Bezir", "GradF",
-    "DithF", "Calli", "SoftB", "PatBr", "Clone", "Smudg"
+    "Pencil", "Line",   "Rect",   "FillRt", "Ellips", "Bucket",
+    "Eraser", "Picker", "Text",   "Poly",   "Spray",  "Select",
+    "RndRct", "Circle", "Star",   "Arrow",  "Bezier", "GrdFll",
+    "DthFll", "Callig", "Soft B", "Pat Br", "Stamp",  "Smudge",
+    "FilOvl", "FilStr", "Spiral", "Blur"
 };
 
 static const uint32_t artos_palette[ARTOS_PALETTE_COUNT] = {
@@ -346,6 +359,24 @@ static const uint32_t artos_palette[ARTOS_PALETTE_COUNT] = {
     0xFF808080, 0xFFC0C0C0, 0xFF800000, 0xFF008000,
     0xFF000080, 0xFF808000, 0xFF800080, 0xFF008080,
 };
+
+/* Sidebar tool layout: grouped by category */
+static const int sidebar_tool_order[ARTOS_TOOL_COUNT] = {
+    /* Draw */  0, 1, 2, 3, 4, 5,
+    /* Shape */ 12, 13, 14, 15, 16, 17,
+    /* Paint */ 6, 10, 19, 20, 21, 27,
+    /* Edit */  7, 22, 23, 18, 24, 25,
+    /* Spec */  8, 9, 11, 26
+};
+static const char *sidebar_tool_labels[ARTOS_TOOL_COUNT] = {
+    "Pencil","Line","Rect","Fill Rect","Ellipse","Fill",
+    "Round Rect","Circle","Star","Arrow","Bezier","Grad Fill",
+    "Eraser","Spray","Callig","Soft Brush","Pat Brush","Blur",
+    "Eyedropper","Clone","Smudge","Dith Fill","Fill Oval","Fill Star",
+    "Text","Polygon","Select","Spiral"
+};
+/* Group sizes: 6,6,6,6,4 — dividers between each group */
+static const int sidebar_group_sizes[5] = { 6, 6, 6, 6, 4 };
 
 /* Layer structure */
 struct artos_layer {
@@ -442,6 +473,13 @@ static struct {
     int         ai_input_active;
     uint32_t    ai_rand_seed;
 
+    /* Groq AI proxy */
+    int         groq_pending;
+    uint64_t    groq_send_ms;
+    char        groq_response[512];
+    int         groq_resp_len;
+    char        groq_status[32];
+
     /* DrawNet Collaboration */
     int         drawnet_enabled;
     char        drawnet_session_id[16];
@@ -456,6 +494,10 @@ static struct {
     uint32_t    drawnet_stroke_seq;
     char        drawnet_input[16];
     int         drawnet_input_active;
+
+    /* Export */
+    char        export_status[24];
+    uint64_t    export_status_time;
 } art;
 
 /*============================================================================
@@ -5960,6 +6002,120 @@ static void artos_composite_layers(void)
     }
 }
 
+/* --- BMP Export (canvas → ATA disk + GeoFS) --- */
+#define ARTOS_BMP_HDR_SIZE   54
+#define ARTOS_BMP_ROW_BYTES  (ARTOS_CANVAS_W * 3)
+#define ARTOS_BMP_DATA_SIZE  (ARTOS_BMP_ROW_BYTES * ARTOS_CANVAS_H)
+#define ARTOS_BMP_FILE_SIZE  (ARTOS_BMP_HDR_SIZE + ARTOS_BMP_DATA_SIZE)
+#define ARTOS_BMP_ATA_SECTOR 8192
+#define ARTOS_BMP_ATA_COUNT  ((ARTOS_BMP_FILE_SIZE + 511) / 512)
+
+static void artos_export_bmp(void)
+{
+    artos_composite_layers();
+
+    /* Build 54-byte BMP header */
+    uint8_t hdr[ARTOS_BMP_HDR_SIZE];
+    memset(hdr, 0, ARTOS_BMP_HDR_SIZE);
+    /* File header (14 bytes) */
+    hdr[0] = 'B'; hdr[1] = 'M';
+    uint32_t fsize = ARTOS_BMP_FILE_SIZE;
+    hdr[2] = (uint8_t)(fsize); hdr[3] = (uint8_t)(fsize >> 8);
+    hdr[4] = (uint8_t)(fsize >> 16); hdr[5] = (uint8_t)(fsize >> 24);
+    hdr[10] = ARTOS_BMP_HDR_SIZE;
+    /* DIB header (40 bytes) */
+    hdr[14] = 40;
+    hdr[18] = (uint8_t)(ARTOS_CANVAS_W); hdr[19] = (uint8_t)(ARTOS_CANVAS_W >> 8);
+    hdr[22] = (uint8_t)(ARTOS_CANVAS_H); hdr[23] = (uint8_t)(ARTOS_CANVAS_H >> 8);
+    hdr[26] = 1;   /* planes */
+    hdr[28] = 24;  /* bpp */
+    uint32_t isz = ARTOS_BMP_DATA_SIZE;
+    hdr[34] = (uint8_t)(isz); hdr[35] = (uint8_t)(isz >> 8);
+    hdr[36] = (uint8_t)(isz >> 16); hdr[37] = (uint8_t)(isz >> 24);
+    hdr[38] = 0x13; hdr[39] = 0x0B; /* 2835 ppm (72 DPI) */
+    hdr[42] = 0x13; hdr[43] = 0x0B;
+
+    int has_disk = (ata_drive_count() >= 1);
+    int error = 0;
+
+    /* --- ATA: sector-by-sector write (avoids large kmalloc) --- */
+    if (has_disk) {
+        uint8_t sec[512];
+        int sp = 0;
+        uint64_t si = 0;
+
+        /* Append bytes to sector buffer, flush when full */
+        #define BMP_APPEND(ptr, len) do { \
+            const uint8_t *_p = (const uint8_t *)(ptr); \
+            int _r = (len); \
+            while (_r > 0 && !error) { \
+                int c = (512 - sp < _r) ? 512 - sp : _r; \
+                memcpy(sec + sp, _p, c); \
+                sp += c; _p += c; _r -= c; \
+                if (sp == 512) { \
+                    if (ata_write_sectors(0, ARTOS_BMP_ATA_SECTOR + si, 1, sec) != ATA_OK) \
+                        error = 1; \
+                    si++; sp = 0; \
+                } \
+            } \
+        } while(0)
+
+        BMP_APPEND(hdr, ARTOS_BMP_HDR_SIZE);
+        for (int y = ARTOS_CANVAS_H - 1; y >= 0 && !error; y--) {
+            for (int x = 0; x < ARTOS_CANVAS_W && !error; x++) {
+                uint32_t argb = art.composite[y * ARTOS_CANVAS_W + x];
+                uint8_t bgr[3];
+                bgr[0] = (uint8_t)(argb);
+                bgr[1] = (uint8_t)(argb >> 8);
+                bgr[2] = (uint8_t)(argb >> 16);
+                BMP_APPEND(bgr, 3);
+            }
+        }
+        /* Flush final partial sector */
+        if (sp > 0 && !error) {
+            memset(sec + sp, 0, 512 - sp);
+            if (ata_write_sectors(0, ARTOS_BMP_ATA_SECTOR + si, 1, sec) != ATA_OK)
+                error = 1;
+        }
+        if (!error) ata_flush(0);
+        #undef BMP_APPEND
+    }
+
+    /* --- GeoFS: save a copy visible in File Browser --- */
+    if (fs_vol) {
+        uint8_t *bmp = (uint8_t *)kmalloc(ARTOS_BMP_FILE_SIZE);
+        if (bmp) {
+            memcpy(bmp, hdr, ARTOS_BMP_HDR_SIZE);
+            int off = ARTOS_BMP_HDR_SIZE;
+            for (int y = ARTOS_CANVAS_H - 1; y >= 0; y--) {
+                for (int x = 0; x < ARTOS_CANVAS_W; x++) {
+                    uint32_t argb = art.composite[y * ARTOS_CANVAS_W + x];
+                    bmp[off++] = (uint8_t)(argb);
+                    bmp[off++] = (uint8_t)(argb >> 8);
+                    bmp[off++] = (uint8_t)(argb >> 16);
+                }
+            }
+            kgeofs_mkdir(fs_vol, "/exports");
+            kgeofs_file_write(fs_vol, "/exports/canvas.bmp", bmp, ARTOS_BMP_FILE_SIZE);
+            kfree(bmp);
+        }
+    }
+
+    /* Status feedback */
+    if (error)
+        strcpy(art.export_status, "Export failed!");
+    else if (has_disk)
+        strcpy(art.export_status, "Exported!");
+    else if (fs_vol)
+        strcpy(art.export_status, "Saved to GeoFS");
+    else
+        strcpy(art.export_status, "No disk!");
+    art.export_status_time = timer_get_ticks();
+
+    kprintf("[ArtOS] BMP export: %s (ATA sector %u, %u sectors)\n",
+            art.export_status, ARTOS_BMP_ATA_SECTOR, ARTOS_BMP_ATA_COUNT);
+}
+
 /* --- Canvas access (operates on active layer) --- */
 static void artos_canvas_set(int cx, int cy, uint32_t color)
 {
@@ -6130,33 +6286,186 @@ static void artos_ellipse(int cx, int cy, int rx, int ry, uint32_t color)
 }
 
 /*============================================================================
- * AI Art Generator - Keyword Parser & Procedural Generation
+ * AI Art Generator v2 - Scene Composition Pipeline
  *============================================================================*/
 
-/* AI pattern types */
-#define AI_PATTERN_SOLID     0
-#define AI_PATTERN_GRADIENT  1
-#define AI_PATTERN_CIRCLES   2
-#define AI_PATTERN_SQUARES   3
-#define AI_PATTERN_LINES     4
-#define AI_PATTERN_DOTS      5
-#define AI_PATTERN_WAVES     6
+/* Forward declarations for drawing primitives defined later */
+static void artos_star(int cx, int cy, int radius, int sides, uint32_t color);
 
-/* AI direction flags */
-#define AI_DIR_VERTICAL      0
-#define AI_DIR_HORIZONTAL    1
+/* Scene element types */
+#define AI_ELEM_NONE        0
+#define AI_ELEM_SUN         1
+#define AI_ELEM_MOON        2
+#define AI_ELEM_STARS       3
+#define AI_ELEM_CLOUDS      4
+#define AI_ELEM_MOUNTAINS   5
+#define AI_ELEM_TREES       6
+#define AI_ELEM_WATER       7
+#define AI_ELEM_RAIN        8
+#define AI_ELEM_SNOW        9
+#define AI_ELEM_BUILDINGS   10
+#define AI_ELEM_FLOWERS     11
+#define AI_ELEM_HEARTS      12
+#define AI_ELEM_DIAMONDS    13
+#define AI_ELEM_FIRE_FX     14
+#define AI_ELEM_AURORA      15
+#define AI_ELEM_LIGHTNING   16
+#define AI_ELEM_BUTTERFLIES 17
+#define AI_ELEM_BIRDS       18
+#define AI_ELEM_RAINBOW     19
+#define AI_ELEM_PLANETS     20
+#define AI_ELEM_LIGHTHOUSE  21
+#define AI_ELEM_BOATS       22
+#define AI_ELEM_WINDMILL    23
+#define AI_MAX_ELEMS        12
 
-/* Parsed AI prompt result */
-struct ai_keywords {
-    uint32_t base_color;     /* Primary color */
-    uint32_t accent_color;   /* Secondary color for gradients */
-    int      pattern_type;   /* AI_PATTERN_* */
-    int      density;        /* Number of shapes (5=few, 20=many) */
-    int      direction;      /* AI_DIR_* */
-    int      brightness;     /* 0=dark, 1=normal, 2=bright */
+/* Theme IDs */
+#define AI_THEME_DEFAULT    0
+#define AI_THEME_SUNSET     1
+#define AI_THEME_OCEAN      2
+#define AI_THEME_FOREST     3
+#define AI_THEME_NIGHT      4
+#define AI_THEME_DESERT     5
+#define AI_THEME_FIRE       6
+#define AI_THEME_SKY        7
+#define AI_THEME_GALAXY     8
+#define AI_THEME_RAINBOW    9
+#define AI_THEME_PASTEL     10
+#define AI_THEME_AUTUMN     11
+#define AI_THEME_WINTER     12
+#define AI_THEME_SPRING     13
+#define AI_THEME_NEON       14
+#define AI_THEME_MONO       15
+#define AI_THEME_GOLD       16
+#define AI_THEME_LAVENDER   17
+#define AI_THEME_CORAL      18
+#define AI_THEME_AURORA     19
+#define AI_THEME_UNDERWATER 20
+#define AI_THEME_VOLCANO    21
+#define AI_THEME_CYBERPUNK  22
+#define AI_THEME_JUNGLE     23
+#define AI_THEME_ARCTIC     24
+#define AI_THEME_MEADOW     25
+#define AI_THEME_STORM      26
+#define AI_THEME_TWILIGHT   27
+#define AI_THEME_CAVE       28
+#define AI_THEME_BEACH      29
+
+/* Style modifiers */
+#define AI_STYLE_NORMAL     0
+#define AI_STYLE_ABSTRACT   1
+#define AI_STYLE_GEOMETRIC  2
+#define AI_STYLE_ORGANIC    3
+#define AI_STYLE_MINIMAL    4
+#define AI_STYLE_CHAOTIC    5
+#define AI_STYLE_PIXEL      6
+
+/* Composition modifiers */
+#define AI_COMP_NORMAL      0
+#define AI_COMP_PANORAMIC   1
+#define AI_COMP_TALL        2
+#define AI_COMP_CENTERED    3
+
+/* Pattern overlay types */
+#define AI_PAT_NONE         -1
+#define AI_PAT_CIRCLES      0
+#define AI_PAT_SQUARES      1
+#define AI_PAT_LINES        2
+#define AI_PAT_DOTS         3
+#define AI_PAT_WAVES        4
+#define AI_PAT_SPIRAL       5
+#define AI_PAT_CHECKER      6
+#define AI_PAT_NOISE        7
+#define AI_PAT_RADIAL       8
+#define AI_PAT_GRID         9
+#define AI_PAT_CROSSHATCH   10
+#define AI_PAT_ZIGZAG       11
+#define AI_PAT_RINGS        12
+#define AI_PAT_BRANCH       13
+
+/* 5-color palette per theme */
+struct ai_palette {
+    uint32_t sky_top;
+    uint32_t sky_bottom;
+    uint32_t ground;
+    uint32_t accent1;
+    uint32_t accent2;
 };
 
-/* Simple string comparison helper */
+/* Full scene description */
+struct ai_scene {
+    int              theme;
+    int              style;
+    int              pattern;           /* AI_PAT_* or AI_PAT_NONE */
+    int              density;           /* 5=sparse, 15=normal, 30=dense */
+    int              brightness;        /* 0=dark, 1=normal, 2=bright */
+    int              horizon_y;         /* horizon line (0-300) */
+    int              has_ground;
+    int              elements[AI_MAX_ELEMS];
+    int              elem_count;
+    struct ai_palette pal;
+    int              composition;     /* AI_COMP_* */
+    uint32_t         color_override;  /* 0=none, or color to tint accents */
+};
+
+/* Theme palette lookup table */
+static const struct ai_palette ai_palettes[] = {
+    /* DEFAULT  */ {0xFF808080, 0xFFC0C0C0, 0xFF606060, 0xFFFFFFFF, 0xFF404040},
+    /* SUNSET   */ {0xFFFF4500, 0xFFFF8C00, 0xFF2F1B14, 0xFFFFD700, 0xFFFF6347},
+    /* OCEAN    */ {0xFF87CEEB, 0xFF4682B4, 0xFF003366, 0xFF00BFFF, 0xFF00CED1},
+    /* FOREST   */ {0xFF87CEEB, 0xFF90EE90, 0xFF2E8B57, 0xFF228B22, 0xFF006400},
+    /* NIGHT    */ {0xFF0A0A2E, 0xFF191970, 0xFF0D0D1A, 0xFF8888FF, 0xFFFFFFCC},
+    /* DESERT   */ {0xFFFFD700, 0xFFF4A460, 0xFFD2B48C, 0xFFCD853F, 0xFFFFF8DC},
+    /* FIRE     */ {0xFF8B0000, 0xFFFF4500, 0xFF2B0000, 0xFFFF6600, 0xFFFFFF00},
+    /* SKY      */ {0xFF4169E1, 0xFF87CEEB, 0xFF90EE90, 0xFFFFFFFF, 0xFFB0C4DE},
+    /* GALAXY   */ {0xFF0B0033, 0xFF1A0044, 0xFF0D001A, 0xFF9966FF, 0xFFFF66FF},
+    /* RAINBOW  */ {0xFFFF0000, 0xFFFF8800, 0xFF00CC00, 0xFF0066FF, 0xFF9900FF},
+    /* PASTEL   */ {0xFFFFB3BA, 0xFFBAE1FF, 0xFFBAFFBA, 0xFFFFDFBA, 0xFFE8BAFF},
+    /* AUTUMN   */ {0xFFFF8C00, 0xFFCD853F, 0xFF8B4513, 0xFFFF4500, 0xFFDAA520},
+    /* WINTER   */ {0xFFB0C4DE, 0xFFE0E8F0, 0xFFDCDCDC, 0xFFADD8E6, 0xFFFFFFFF},
+    /* SPRING   */ {0xFF87CEEB, 0xFF98FB98, 0xFF90EE90, 0xFFFF69B4, 0xFFFFB6C1},
+    /* NEON     */ {0xFF0D0D0D, 0xFF1A1A2E, 0xFF0F0F1A, 0xFF00FF00, 0xFFFF00FF},
+    /* MONO     */ {0xFF303030, 0xFF808080, 0xFF505050, 0xFFFFFFFF, 0xFFA0A0A0},
+    /* GOLD     */ {0xFF8B6914, 0xFFDAA520, 0xFF4B3621, 0xFFFFD700, 0xFFFFF8DC},
+    /* LAVENDER */ {0xFF9370DB, 0xFFD8BFD8, 0xFF7B68EE, 0xFFE6E6FA, 0xFFDDA0DD},
+    /* CORAL    */ {0xFFFF7F50, 0xFFFF6B6B, 0xFF8B3A3A, 0xFFFFB07C, 0xFFFFA07A},
+    /* AURORA   */ {0xFF0A0A2E, 0xFF001833, 0xFF0D0D1A, 0xFF00FF88, 0xFF00CCFF},
+    /* UNDERWATER */ {0xFF003366, 0xFF001A33, 0xFF002244, 0xFF00BFFF, 0xFF00FF80},
+    /* VOLCANO  */ {0xFF330000, 0xFF661100, 0xFF1A0000, 0xFFFF4400, 0xFFFFCC00},
+    /* CYBERPUNK*/ {0xFF0A0014, 0xFF1A0033, 0xFF0D0D1A, 0xFF00FFFF, 0xFFFF00FF},
+    /* JUNGLE   */ {0xFF87CEEB, 0xFF66AA44, 0xFF1A4D1A, 0xFF00CC00, 0xFF33FF33},
+    /* ARCTIC   */ {0xFFA0C8E8, 0xFFD0E8F8, 0xFFE8F0FF, 0xFFFFFFFF, 0xFF88CCEE},
+    /* MEADOW   */ {0xFF87CEEB, 0xFF90EE90, 0xFF7CCD7C, 0xFFFF69B4, 0xFFFFD700},
+    /* STORM    */ {0xFF2E2E3E, 0xFF4A4A5E, 0xFF1A1A2A, 0xFF8888AA, 0xFFCCCCDD},
+    /* TWILIGHT */ {0xFF1A0033, 0xFF330066, 0xFF0D001A, 0xFFFF8800, 0xFF8866CC},
+    /* CAVE     */ {0xFF1A1410, 0xFF2A2420, 0xFF0F0D0A, 0xFF886644, 0xFF554433},
+    /* BEACH    */ {0xFF4488CC, 0xFF66AADD, 0xFFF4E8C8, 0xFFFFDD44, 0xFF00CCBB},
+};
+
+/* Check if char is alphabetic */
+static int ai_is_alpha(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+/* Word boundary match: needle must appear with non-alpha boundaries */
+static int ai_word_match(const char *haystack, const char *needle)
+{
+    int nlen = 0;
+    while (needle[nlen]) nlen++;
+    for (int i = 0; haystack[i]; i++) {
+        int j;
+        for (j = 0; needle[j] && haystack[i + j] == needle[j]; j++);
+        if (needle[j] == '\0') {
+            if (i > 0 && ai_is_alpha(haystack[i - 1])) continue;
+            if (ai_is_alpha(haystack[i + nlen])) continue;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Simple string comparison helper (kept for compat) */
 static int ai_strstr(const char *haystack, const char *needle)
 {
     int i, j;
@@ -6167,93 +6476,327 @@ static int ai_strstr(const char *haystack, const char *needle)
     return 0;
 }
 
-/* Parse AI prompt keywords */
-static struct ai_keywords parse_ai_keywords(const char *prompt)
+/* Color utility helpers */
+static uint32_t ai_darken(uint32_t color, int amount)
 {
-    struct ai_keywords kw;
+    int r = ((color >> 16) & 0xFF) - amount; if (r < 0) r = 0;
+    int g = ((color >> 8) & 0xFF) - amount; if (g < 0) g = 0;
+    int b = (color & 0xFF) - amount; if (b < 0) b = 0;
+    return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
 
-    /* Defaults */
-    kw.base_color = 0xFF808080;     /* Gray */
-    kw.accent_color = 0xFFC0C0C0;   /* Light gray */
-    kw.pattern_type = AI_PATTERN_SOLID;
-    kw.density = 10;
-    kw.direction = AI_DIR_VERTICAL;
-    kw.brightness = 1;
+static uint32_t ai_lighten(uint32_t color, int amount)
+{
+    int r = ((color >> 16) & 0xFF) + amount; if (r > 255) r = 255;
+    int g = ((color >> 8) & 0xFF) + amount; if (g > 255) g = 255;
+    int b = (color & 0xFF) + amount; if (b > 255) b = 255;
+    return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
 
-    /* Color keywords */
-    if (ai_strstr(prompt, "sunset")) {
-        kw.base_color = 0xFFFF6B00;      /* Orange */
-        kw.accent_color = 0xFFFF0000;    /* Red */
-    } else if (ai_strstr(prompt, "ocean") || ai_strstr(prompt, "sea") || ai_strstr(prompt, "water")) {
-        kw.base_color = 0xFF0080FF;      /* Blue */
-        kw.accent_color = 0xFF00FFFF;    /* Cyan */
-    } else if (ai_strstr(prompt, "forest") || ai_strstr(prompt, "tree") || ai_strstr(prompt, "green")) {
-        kw.base_color = 0xFF00A000;      /* Green */
-        kw.accent_color = 0xFF80FF80;    /* Light green */
-    } else if (ai_strstr(prompt, "night") || ai_strstr(prompt, "dark")) {
-        kw.base_color = 0xFF000040;      /* Dark blue */
-        kw.accent_color = 0xFF8080FF;    /* Light blue */
-    } else if (ai_strstr(prompt, "desert") || ai_strstr(prompt, "sand")) {
-        kw.base_color = 0xFFE0C040;      /* Yellow-brown */
-        kw.accent_color = 0xFFFFFF80;    /* Light yellow */
-    } else if (ai_strstr(prompt, "fire") || ai_strstr(prompt, "flame")) {
-        kw.base_color = 0xFFFF0000;      /* Red */
-        kw.accent_color = 0xFFFFFF00;    /* Yellow */
-    } else if (ai_strstr(prompt, "sky") || ai_strstr(prompt, "cloud")) {
-        kw.base_color = 0xFF87CEEB;      /* Sky blue */
-        kw.accent_color = 0xFFFFFFFF;    /* White */
+static uint32_t ai_blend_colors(uint32_t c1, uint32_t c2, int t256)
+{
+    if (t256 < 0) t256 = 0; if (t256 > 256) t256 = 256;
+    int r = (int)((c1 >> 16) & 0xFF) + ((int)((c2 >> 16) & 0xFF) - (int)((c1 >> 16) & 0xFF)) * t256 / 256;
+    int g = (int)((c1 >> 8) & 0xFF) + ((int)((c2 >> 8) & 0xFF) - (int)((c1 >> 8) & 0xFF)) * t256 / 256;
+    int b = (int)(c1 & 0xFF) + ((int)(c2 & 0xFF) - (int)(c1 & 0xFF)) * t256 / 256;
+    return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+/* Brighten/darken an entire palette */
+static struct ai_palette ai_adjust_palette(struct ai_palette p, int brightness)
+{
+    if (brightness == 2) {
+        p.sky_top = ai_lighten(p.sky_top, 40);
+        p.sky_bottom = ai_lighten(p.sky_bottom, 40);
+        p.ground = ai_lighten(p.ground, 40);
+        p.accent1 = ai_lighten(p.accent1, 40);
+        p.accent2 = ai_lighten(p.accent2, 40);
+    } else if (brightness == 0) {
+        p.sky_top = ai_darken(p.sky_top, 50);
+        p.sky_bottom = ai_darken(p.sky_bottom, 50);
+        p.ground = ai_darken(p.ground, 50);
+        p.accent1 = ai_darken(p.accent1, 30);
+        p.accent2 = ai_darken(p.accent2, 30);
+    }
+    return p;
+}
+
+/* Tint accent colors toward a target color */
+static struct ai_palette ai_tint_accents(struct ai_palette p, uint32_t tint)
+{
+    p.accent1 = ai_blend_colors(p.accent1, tint, 128);
+    p.accent2 = ai_blend_colors(p.accent2, tint, 96);
+    return p;
+}
+
+/* Atmospheric depth tinting: blend toward sky based on distance */
+static uint32_t ai_depth_tint(uint32_t color, uint32_t sky_color, int depth256)
+{
+    if (depth256 < 0) depth256 = 0;
+    if (depth256 > 200) depth256 = 200;
+    return ai_blend_colors(color, sky_color, depth256);
+}
+
+/* Scene element accumulator */
+static void ai_scene_add_elem(struct ai_scene *sc, int elem)
+{
+    if (sc->elem_count >= AI_MAX_ELEMS) return;
+    for (int i = 0; i < sc->elem_count; i++)
+        if (sc->elements[i] == elem) return;
+    sc->elements[sc->elem_count++] = elem;
+}
+
+/* Check if scene has a specific element */
+static int ai_scene_has(struct ai_scene *sc, int elem)
+{
+    for (int i = 0; i < sc->elem_count; i++)
+        if (sc->elements[i] == elem) return 1;
+    return 0;
+}
+
+/* Parse AI prompt into scene description */
+static struct ai_scene parse_ai_scene(const char *prompt)
+{
+    struct ai_scene sc;
+    int i;
+    for (i = 0; i < (int)sizeof(sc); i++) ((char *)&sc)[i] = 0;
+    sc.theme = AI_THEME_DEFAULT;
+    sc.style = AI_STYLE_NORMAL;
+    sc.pattern = AI_PAT_NONE;
+    sc.density = 15;
+    sc.brightness = 1;
+    sc.horizon_y = 200;
+    sc.has_ground = 0;
+    sc.elem_count = 0;
+    sc.composition = AI_COMP_NORMAL;
+    sc.color_override = 0;
+
+    /* Theme detection (first match wins) — using word boundary matching */
+    if (ai_word_match(prompt, "sunset") || ai_word_match(prompt, "sunrise"))
+        sc.theme = AI_THEME_SUNSET;
+    else if (ai_word_match(prompt, "ocean") || ai_word_match(prompt, "sea"))
+        sc.theme = AI_THEME_OCEAN;
+    else if (ai_word_match(prompt, "forest"))
+        sc.theme = AI_THEME_FOREST;
+    else if (ai_word_match(prompt, "galaxy") || ai_word_match(prompt, "space") || ai_word_match(prompt, "cosmic"))
+        sc.theme = AI_THEME_GALAXY;
+    else if (ai_word_match(prompt, "underwater") || ai_word_match(prompt, "deep sea"))
+        sc.theme = AI_THEME_UNDERWATER;
+    else if (ai_word_match(prompt, "volcano") || ai_word_match(prompt, "volcanic") || ai_word_match(prompt, "lava"))
+        sc.theme = AI_THEME_VOLCANO;
+    else if (ai_word_match(prompt, "cyberpunk") || ai_word_match(prompt, "cyber"))
+        sc.theme = AI_THEME_CYBERPUNK;
+    else if (ai_word_match(prompt, "jungle") || ai_word_match(prompt, "tropical"))
+        sc.theme = AI_THEME_JUNGLE;
+    else if (ai_word_match(prompt, "arctic") || ai_word_match(prompt, "polar"))
+        sc.theme = AI_THEME_ARCTIC;
+    else if (ai_word_match(prompt, "meadow") || ai_word_match(prompt, "field"))
+        sc.theme = AI_THEME_MEADOW;
+    else if (ai_word_match(prompt, "storm") || ai_word_match(prompt, "thunder"))
+        sc.theme = AI_THEME_STORM;
+    else if (ai_word_match(prompt, "twilight") || ai_word_match(prompt, "dusk"))
+        sc.theme = AI_THEME_TWILIGHT;
+    else if (ai_word_match(prompt, "cave") || ai_word_match(prompt, "cavern"))
+        sc.theme = AI_THEME_CAVE;
+    else if (ai_word_match(prompt, "beach") || ai_word_match(prompt, "coast") || ai_word_match(prompt, "shore"))
+        sc.theme = AI_THEME_BEACH;
+    else if (ai_word_match(prompt, "rainbow"))
+        sc.theme = AI_THEME_RAINBOW;
+    else if (ai_word_match(prompt, "pastel") || ai_word_match(prompt, "soft"))
+        sc.theme = AI_THEME_PASTEL;
+    else if (ai_word_match(prompt, "autumn") || ai_word_match(prompt, "fall"))
+        sc.theme = AI_THEME_AUTUMN;
+    else if (ai_word_match(prompt, "winter") || ai_word_match(prompt, "ice") || ai_word_match(prompt, "frozen"))
+        sc.theme = AI_THEME_WINTER;
+    else if (ai_word_match(prompt, "spring") || ai_word_match(prompt, "bloom"))
+        sc.theme = AI_THEME_SPRING;
+    else if (ai_word_match(prompt, "neon") || ai_word_match(prompt, "glow"))
+        sc.theme = AI_THEME_NEON;
+    else if (ai_word_match(prompt, "mono") || ai_word_match(prompt, "grayscale"))
+        sc.theme = AI_THEME_MONO;
+    else if (ai_word_match(prompt, "gold") || ai_word_match(prompt, "golden"))
+        sc.theme = AI_THEME_GOLD;
+    else if (ai_word_match(prompt, "lavender"))
+        sc.theme = AI_THEME_LAVENDER;
+    else if (ai_word_match(prompt, "coral"))
+        sc.theme = AI_THEME_CORAL;
+    else if (ai_word_match(prompt, "aurora") || ai_word_match(prompt, "northern"))
+        sc.theme = AI_THEME_AURORA;
+    else if (ai_word_match(prompt, "night") || ai_word_match(prompt, "dark"))
+        sc.theme = AI_THEME_NIGHT;
+    else if (ai_word_match(prompt, "desert") || ai_word_match(prompt, "sand"))
+        sc.theme = AI_THEME_DESERT;
+    else if (ai_word_match(prompt, "fire") || ai_word_match(prompt, "flame"))
+        sc.theme = AI_THEME_FIRE;
+    else if (ai_word_match(prompt, "sky") || ai_word_match(prompt, "cloud"))
+        sc.theme = AI_THEME_SKY;
+
+    /* Scene elements (ALL checked, not else-if) */
+    if (ai_word_match(prompt, "sun"))
+        ai_scene_add_elem(&sc, AI_ELEM_SUN);
+    if (ai_word_match(prompt, "moon") || ai_word_match(prompt, "crescent"))
+        ai_scene_add_elem(&sc, AI_ELEM_MOON);
+    if (ai_word_match(prompt, "star") || ai_word_match(prompt, "stars"))
+        ai_scene_add_elem(&sc, AI_ELEM_STARS);
+    if (ai_word_match(prompt, "cloud") || ai_word_match(prompt, "clouds"))
+        ai_scene_add_elem(&sc, AI_ELEM_CLOUDS);
+    if (ai_word_match(prompt, "mountain") || ai_word_match(prompt, "peak") || ai_word_match(prompt, "hill"))
+        { ai_scene_add_elem(&sc, AI_ELEM_MOUNTAINS); sc.has_ground = 1; }
+    if (ai_word_match(prompt, "tree") || ai_word_match(prompt, "trees") || ai_word_match(prompt, "forest"))
+        { ai_scene_add_elem(&sc, AI_ELEM_TREES); sc.has_ground = 1; }
+    if (ai_word_match(prompt, "water") || ai_word_match(prompt, "ocean") || ai_word_match(prompt, "sea")
+        || ai_word_match(prompt, "lake") || ai_word_match(prompt, "wave"))
+        ai_scene_add_elem(&sc, AI_ELEM_WATER);
+    if (ai_word_match(prompt, "rain"))
+        ai_scene_add_elem(&sc, AI_ELEM_RAIN);
+    if (ai_word_match(prompt, "snow") || ai_word_match(prompt, "snowflake"))
+        ai_scene_add_elem(&sc, AI_ELEM_SNOW);
+    if (ai_word_match(prompt, "building") || ai_word_match(prompt, "city") || ai_word_match(prompt, "house")
+        || ai_word_match(prompt, "skyline"))
+        { ai_scene_add_elem(&sc, AI_ELEM_BUILDINGS); sc.has_ground = 1; }
+    if (ai_word_match(prompt, "flower") || ai_word_match(prompt, "flowers") || ai_word_match(prompt, "rose"))
+        { ai_scene_add_elem(&sc, AI_ELEM_FLOWERS); sc.has_ground = 1; }
+    if (ai_word_match(prompt, "heart") || ai_word_match(prompt, "love"))
+        ai_scene_add_elem(&sc, AI_ELEM_HEARTS);
+    if (ai_word_match(prompt, "diamond") || ai_word_match(prompt, "gem"))
+        ai_scene_add_elem(&sc, AI_ELEM_DIAMONDS);
+    if (ai_word_match(prompt, "fire") || ai_word_match(prompt, "flame"))
+        ai_scene_add_elem(&sc, AI_ELEM_FIRE_FX);
+    if (ai_word_match(prompt, "aurora") || ai_word_match(prompt, "northern"))
+        ai_scene_add_elem(&sc, AI_ELEM_AURORA);
+    /* v3 new elements */
+    if (ai_word_match(prompt, "lightning") || ai_word_match(prompt, "bolt"))
+        ai_scene_add_elem(&sc, AI_ELEM_LIGHTNING);
+    if (ai_word_match(prompt, "butterfly") || ai_word_match(prompt, "butterflies"))
+        ai_scene_add_elem(&sc, AI_ELEM_BUTTERFLIES);
+    if (ai_word_match(prompt, "bird") || ai_word_match(prompt, "birds") || ai_word_match(prompt, "flock"))
+        ai_scene_add_elem(&sc, AI_ELEM_BIRDS);
+    if (ai_word_match(prompt, "rainbow"))
+        ai_scene_add_elem(&sc, AI_ELEM_RAINBOW);
+    if (ai_word_match(prompt, "planet") || ai_word_match(prompt, "planets") || ai_word_match(prompt, "saturn"))
+        ai_scene_add_elem(&sc, AI_ELEM_PLANETS);
+    if (ai_word_match(prompt, "lighthouse"))
+        { ai_scene_add_elem(&sc, AI_ELEM_LIGHTHOUSE); sc.has_ground = 1; }
+    if (ai_word_match(prompt, "boat") || ai_word_match(prompt, "ship") || ai_word_match(prompt, "sail"))
+        ai_scene_add_elem(&sc, AI_ELEM_BOATS);
+    if (ai_word_match(prompt, "windmill"))
+        { ai_scene_add_elem(&sc, AI_ELEM_WINDMILL); sc.has_ground = 1; }
+
+    /* Theme-implied elements */
+    if (sc.theme == AI_THEME_NIGHT || sc.theme == AI_THEME_GALAXY)
+        ai_scene_add_elem(&sc, AI_ELEM_STARS);
+    if (sc.theme == AI_THEME_OCEAN)
+        ai_scene_add_elem(&sc, AI_ELEM_WATER);
+    if (sc.theme == AI_THEME_FOREST)
+        { ai_scene_add_elem(&sc, AI_ELEM_TREES); sc.has_ground = 1; }
+    if (sc.theme == AI_THEME_SUNSET)
+        ai_scene_add_elem(&sc, AI_ELEM_SUN);
+    if (sc.theme == AI_THEME_AURORA)
+        ai_scene_add_elem(&sc, AI_ELEM_AURORA);
+    /* v3 theme-implied elements */
+    if (sc.theme == AI_THEME_UNDERWATER)
+        { ai_scene_add_elem(&sc, AI_ELEM_WATER); sc.horizon_y = 0; sc.has_ground = 1; }
+    if (sc.theme == AI_THEME_VOLCANO)
+        { ai_scene_add_elem(&sc, AI_ELEM_MOUNTAINS); ai_scene_add_elem(&sc, AI_ELEM_FIRE_FX); sc.has_ground = 1; }
+    if (sc.theme == AI_THEME_STORM)
+        { ai_scene_add_elem(&sc, AI_ELEM_CLOUDS); ai_scene_add_elem(&sc, AI_ELEM_RAIN); ai_scene_add_elem(&sc, AI_ELEM_LIGHTNING); }
+    if (sc.theme == AI_THEME_CYBERPUNK)
+        { ai_scene_add_elem(&sc, AI_ELEM_BUILDINGS); sc.has_ground = 1; }
+    if (sc.theme == AI_THEME_JUNGLE)
+        { ai_scene_add_elem(&sc, AI_ELEM_TREES); ai_scene_add_elem(&sc, AI_ELEM_FLOWERS); sc.has_ground = 1; sc.density = 25; }
+    if (sc.theme == AI_THEME_ARCTIC)
+        { ai_scene_add_elem(&sc, AI_ELEM_SNOW); ai_scene_add_elem(&sc, AI_ELEM_MOUNTAINS); sc.has_ground = 1; }
+    if (sc.theme == AI_THEME_MEADOW)
+        { ai_scene_add_elem(&sc, AI_ELEM_FLOWERS); ai_scene_add_elem(&sc, AI_ELEM_TREES); sc.has_ground = 1; sc.density = 25; }
+    if (sc.theme == AI_THEME_TWILIGHT)
+        { ai_scene_add_elem(&sc, AI_ELEM_STARS); ai_scene_add_elem(&sc, AI_ELEM_MOON); ai_scene_add_elem(&sc, AI_ELEM_CLOUDS); }
+    if (sc.theme == AI_THEME_CAVE)
+        { sc.horizon_y = ARTOS_CANVAS_H; sc.has_ground = 0; }
+    if (sc.theme == AI_THEME_BEACH)
+        { ai_scene_add_elem(&sc, AI_ELEM_WATER); ai_scene_add_elem(&sc, AI_ELEM_SUN); sc.horizon_y = 180; sc.has_ground = 1; }
+
+    /* Style modifiers */
+    if (ai_word_match(prompt, "abstract"))       sc.style = AI_STYLE_ABSTRACT;
+    else if (ai_word_match(prompt, "geometric")) sc.style = AI_STYLE_GEOMETRIC;
+    else if (ai_word_match(prompt, "organic"))   sc.style = AI_STYLE_ORGANIC;
+    else if (ai_word_match(prompt, "minimal"))   sc.style = AI_STYLE_MINIMAL;
+    else if (ai_word_match(prompt, "chaotic") || ai_word_match(prompt, "wild"))
+        sc.style = AI_STYLE_CHAOTIC;
+    else if (ai_word_match(prompt, "pixel"))     sc.style = AI_STYLE_PIXEL;
+
+    /* Pattern detection */
+    if (ai_word_match(prompt, "spiral"))         sc.pattern = AI_PAT_SPIRAL;
+    else if (ai_word_match(prompt, "checker"))   sc.pattern = AI_PAT_CHECKER;
+    else if (ai_word_match(prompt, "noise") || ai_word_match(prompt, "texture"))
+        sc.pattern = AI_PAT_NOISE;
+    else if (ai_word_match(prompt, "radial") || ai_word_match(prompt, "burst"))
+        sc.pattern = AI_PAT_RADIAL;
+    else if (ai_word_match(prompt, "grid"))      sc.pattern = AI_PAT_GRID;
+    else if (ai_word_match(prompt, "crosshatch") || ai_word_match(prompt, "hatch"))
+        sc.pattern = AI_PAT_CROSSHATCH;
+    else if (ai_word_match(prompt, "zigzag") || ai_word_match(prompt, "zig"))
+        sc.pattern = AI_PAT_ZIGZAG;
+    else if (ai_word_match(prompt, "ring") || ai_word_match(prompt, "concentric"))
+        sc.pattern = AI_PAT_RINGS;
+    else if (ai_word_match(prompt, "branch") || ai_word_match(prompt, "fractal"))
+        sc.pattern = AI_PAT_BRANCH;
+    else if (ai_word_match(prompt, "circle"))    sc.pattern = AI_PAT_CIRCLES;
+    else if (ai_word_match(prompt, "stripe") || ai_word_match(prompt, "line"))
+        sc.pattern = AI_PAT_LINES;
+    else if (ai_word_match(prompt, "dot") || ai_word_match(prompt, "spot"))
+        sc.pattern = AI_PAT_DOTS;
+    else if (ai_word_match(prompt, "gradient"))  sc.pattern = AI_PAT_WAVES;
+
+    /* Density */
+    if (ai_word_match(prompt, "many") || ai_word_match(prompt, "lots") || ai_word_match(prompt, "dense"))
+        sc.density = 30;
+    else if (ai_word_match(prompt, "few") || ai_word_match(prompt, "sparse"))
+        sc.density = 5;
+
+    /* Brightness */
+    if (ai_word_match(prompt, "bright") || ai_word_match(prompt, "light"))
+        sc.brightness = 2;
+    else if (ai_word_match(prompt, "dim"))
+        sc.brightness = 0;
+
+    /* Color keyword accent override */
+    if (ai_word_match(prompt, "red"))        sc.color_override = 0xFFFF0000;
+    else if (ai_word_match(prompt, "blue"))   sc.color_override = 0xFF0066FF;
+    else if (ai_word_match(prompt, "green"))  sc.color_override = 0xFF00CC00;
+    else if (ai_word_match(prompt, "purple")) sc.color_override = 0xFF9900FF;
+    else if (ai_word_match(prompt, "orange")) sc.color_override = 0xFFFF8800;
+    else if (ai_word_match(prompt, "yellow")) sc.color_override = 0xFFFFDD00;
+    else if (ai_word_match(prompt, "pink"))   sc.color_override = 0xFFFF69B4;
+    else if (ai_word_match(prompt, "teal"))   sc.color_override = 0xFF008080;
+
+    /* Composition modifiers */
+    if (ai_word_match(prompt, "panoramic") || ai_word_match(prompt, "wide"))
+        sc.composition = AI_COMP_PANORAMIC;
+    else if (ai_word_match(prompt, "tall") || ai_word_match(prompt, "vertical"))
+        sc.composition = AI_COMP_TALL;
+    else if (ai_word_match(prompt, "centered") || ai_word_match(prompt, "center"))
+        sc.composition = AI_COMP_CENTERED;
+
+    /* Apply composition to horizon */
+    if (sc.composition == AI_COMP_PANORAMIC && sc.has_ground)
+        sc.horizon_y = 240;
+    else if (sc.composition == AI_COMP_TALL && sc.has_ground)
+        sc.horizon_y = 120;
+
+    /* Adjust horizon for water scenes (if not already set by theme) */
+    if (ai_scene_has(&sc, AI_ELEM_WATER) && sc.theme != AI_THEME_UNDERWATER && sc.theme != AI_THEME_BEACH) {
+        sc.horizon_y = 150;
+        sc.has_ground = 1;
     }
 
-    /* Pattern keywords */
-    if (ai_strstr(prompt, "gradient")) {
-        kw.pattern_type = AI_PATTERN_GRADIENT;
-    } else if (ai_strstr(prompt, "circle")) {
-        kw.pattern_type = AI_PATTERN_CIRCLES;
-    } else if (ai_strstr(prompt, "square") || ai_strstr(prompt, "rect") || ai_strstr(prompt, "box")) {
-        kw.pattern_type = AI_PATTERN_SQUARES;
-    } else if (ai_strstr(prompt, "line") || ai_strstr(prompt, "stripe")) {
-        kw.pattern_type = AI_PATTERN_LINES;
-    } else if (ai_strstr(prompt, "dot") || ai_strstr(prompt, "spot")) {
-        kw.pattern_type = AI_PATTERN_DOTS;
-    } else if (ai_strstr(prompt, "wave") || ai_strstr(prompt, "sine")) {
-        kw.pattern_type = AI_PATTERN_WAVES;
-    }
+    /* Resolve palette */
+    sc.pal = ai_palettes[sc.theme];
+    if (sc.brightness != 1)
+        sc.pal = ai_adjust_palette(sc.pal, sc.brightness);
+    if (sc.color_override != 0)
+        sc.pal = ai_tint_accents(sc.pal, sc.color_override);
 
-    /* Density modifiers */
-    if (ai_strstr(prompt, "many") || ai_strstr(prompt, "lots")) {
-        kw.density = 30;
-    } else if (ai_strstr(prompt, "few") || ai_strstr(prompt, "sparse")) {
-        kw.density = 5;
-    }
-
-    /* Direction modifiers */
-    if (ai_strstr(prompt, "horizontal")) {
-        kw.direction = AI_DIR_HORIZONTAL;
-    } else if (ai_strstr(prompt, "vertical")) {
-        kw.direction = AI_DIR_VERTICAL;
-    }
-
-    /* Brightness modifiers */
-    if (ai_strstr(prompt, "bright") || ai_strstr(prompt, "light")) {
-        kw.brightness = 2;
-        /* Brighten colors */
-        uint8_t r = ((kw.base_color >> 16) & 0xFF);
-        uint8_t g = ((kw.base_color >> 8) & 0xFF);
-        uint8_t b = (kw.base_color & 0xFF);
-        r = (r > 200) ? 255 : r + 55;
-        g = (g > 200) ? 255 : g + 55;
-        b = (b > 200) ? 255 : b + 55;
-        kw.base_color = 0xFF000000 | (r << 16) | (g << 8) | b;
-    } else if (ai_strstr(prompt, "dark") || ai_strstr(prompt, "dim")) {
-        kw.brightness = 0;
-        /* Darken colors */
-        uint8_t r = ((kw.base_color >> 16) & 0xFF) / 2;
-        uint8_t g = ((kw.base_color >> 8) & 0xFF) / 2;
-        uint8_t b = (kw.base_color & 0xFF) / 2;
-        kw.base_color = 0xFF000000 | (r << 16) | (g << 8) | b;
-    }
-
-    return kw;
+    return sc;
 }
 
 /* PRNG for AI art generation (Linear Congruential Generator) */
@@ -6263,143 +6806,1338 @@ static uint32_t ai_rand(void)
     return (art.ai_rand_seed >> 16) & 0x7FFF;
 }
 
-/* Vertical gradient fill on canvas */
-static void artos_fill_gradient_v(uint32_t top_color, uint32_t bottom_color)
-{
-    uint8_t r1 = (top_color >> 16) & 0xFF;
-    uint8_t g1 = (top_color >> 8) & 0xFF;
-    uint8_t b1 = top_color & 0xFF;
-    uint8_t r2 = (bottom_color >> 16) & 0xFF;
-    uint8_t g2 = (bottom_color >> 8) & 0xFF;
-    uint8_t b2 = bottom_color & 0xFF;
+/*--- Procedural shape helpers for AI art ---*/
 
-    for (int y = 0; y < ARTOS_CANVAS_H; y++) {
-        uint8_t r = r1 + ((r2 - r1) * y) / ARTOS_CANVAS_H;
-        uint8_t g = g1 + ((g2 - g1) * y) / ARTOS_CANVAS_H;
-        uint8_t b = b1 + ((b2 - b1) * y) / ARTOS_CANVAS_H;
-        uint32_t color = 0xFF000000 | (r << 16) | (g << 8) | b;
-        for (int x = 0; x < ARTOS_CANVAS_W; x++) {
-            artos_canvas_set(x, y, color);
+/* Gradient band (horizontal stripe with vertical color interpolation) */
+static void ai_draw_gradient_band(int y0, int y1, uint32_t top_color, uint32_t bottom_color)
+{
+    if (y0 < 0) y0 = 0;
+    if (y1 > ARTOS_CANVAS_H) y1 = ARTOS_CANVAS_H;
+    int h = y1 - y0;
+    if (h < 1) return;
+    int r1 = (top_color >> 16) & 0xFF, g1 = (top_color >> 8) & 0xFF, b1 = top_color & 0xFF;
+    int r2 = (bottom_color >> 16) & 0xFF, g2 = (bottom_color >> 8) & 0xFF, b2 = bottom_color & 0xFF;
+    for (int row = 0; row < h; row++) {
+        int r = r1 + ((r2 - r1) * row) / h;
+        int g = g1 + ((g2 - g1) * row) / h;
+        int b = b1 + ((b2 - b1) * row) / h;
+        uint32_t c = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        for (int x = 0; x < ARTOS_CANVAS_W; x++)
+            artos_canvas_set(x, y0 + row, c);
+    }
+}
+
+/* Filled circle via scanlines */
+static void ai_draw_filled_circle(int cx, int cy, int r, uint32_t color)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        int half = isqrt(r * r - dy * dy);
+        for (int dx = -half; dx <= half; dx++)
+            artos_canvas_set(cx + dx, cy + dy, color);
+    }
+}
+
+/* Filled circle with alpha */
+static void ai_draw_filled_circle_opacity(int cx, int cy, int r, uint32_t color, int alpha)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        int half = isqrt(r * r - dy * dy);
+        for (int dx = -half; dx <= half; dx++)
+            artos_canvas_set_opacity(cx + dx, cy + dy, color, alpha);
+    }
+}
+
+/* Integer hash noise (0-255) */
+static int ai_integer_noise(int x, int y)
+{
+    int n = x + y * 57;
+    n = (n << 13) ^ n;
+    return ((n * (n * n * 15731 + 789221) + 1376312589) >> 16) & 0xFF;
+}
+
+/* Sun with radiating rays and glow */
+static void ai_draw_sun(int cx, int cy, int radius, uint32_t color, uint32_t ray_color)
+{
+    /* Soft glow layers */
+    ai_draw_filled_circle_opacity(cx, cy, radius * 4, ray_color, 20);
+    ai_draw_filled_circle_opacity(cx, cy, radius * 3, ray_color, 40);
+    ai_draw_filled_circle_opacity(cx, cy, radius * 2, ray_color, 60);
+    /* Rays */
+    int ray_len = radius * 2;
+    for (int angle = 0; angle < 360; angle += 30) {
+        int x1 = cx + (icos(angle) * (radius + 2)) / 1024;
+        int y1 = cy + (isin(angle) * (radius + 2)) / 1024;
+        int x2 = cx + (icos(angle) * ray_len) / 1024;
+        int y2 = cy + (isin(angle) * ray_len) / 1024;
+        artos_line(x1, y1, x2, y2, ray_color, 1);
+    }
+    /* Core */
+    ai_draw_filled_circle(cx, cy, radius, color);
+    ai_draw_filled_circle(cx, cy, radius / 2, 0xFFFFFF80);
+}
+
+/* Crescent moon with glow */
+static void ai_draw_crescent(int cx, int cy, int radius, uint32_t color)
+{
+    /* Soft moon glow */
+    ai_draw_filled_circle_opacity(cx, cy, radius * 3, color, 15);
+    ai_draw_filled_circle_opacity(cx, cy, radius * 2, color, 30);
+    /* Moon body */
+    ai_draw_filled_circle(cx, cy, radius, color);
+    uint32_t bg = artos_canvas_get(cx + radius + 5, cy - radius);
+    if (bg == 0) bg = 0xFF0A0A2E;
+    ai_draw_filled_circle(cx + radius / 2, cy - radius / 4, radius * 3 / 4, bg);
+}
+
+/* Pine tree (pointed triangle) */
+static void ai_draw_pine(int x, int ground_y, int height, uint32_t trunk_color, uint32_t leaf_color)
+{
+    int tw = height / 8; if (tw < 2) tw = 2;
+    int th = height / 3;
+    artos_fill_rect(x - tw / 2, ground_y - th, x + tw / 2, ground_y, trunk_color);
+    int canopy_h = height - th;
+    int canopy_top = ground_y - height;
+    for (int row = 0; row < canopy_h; row++) {
+        int half_w = (row * height / 3) / canopy_h;
+        int yy = canopy_top + row;
+        for (int dx = -half_w; dx <= half_w; dx++)
+            artos_canvas_set(x + dx, yy, leaf_color);
+    }
+}
+
+/* Deciduous tree (round canopy) */
+static void ai_draw_deciduous(int x, int ground_y, int height, uint32_t trunk_color, uint32_t leaf_color)
+{
+    int tw = height / 7; if (tw < 2) tw = 2;
+    int th = height * 2 / 5;
+    artos_fill_rect(x - tw / 2, ground_y - th, x + tw / 2, ground_y, trunk_color);
+    int canopy_r = height / 3;
+    int canopy_cy = ground_y - th - canopy_r + canopy_r / 4;
+    ai_draw_filled_circle(x, canopy_cy, canopy_r, leaf_color);
+    uint32_t lighter = ai_lighten(leaf_color, 30);
+    ai_draw_filled_circle_opacity(x, canopy_cy - canopy_r / 3, canopy_r / 2, lighter, 120);
+}
+
+/* Tree dispatcher: randomly picks pine or deciduous */
+static void ai_draw_tree(int x, int ground_y, int height, uint32_t trunk_color, uint32_t leaf_color)
+{
+    if (ai_rand() % 3 == 0)
+        ai_draw_deciduous(x, ground_y, height, trunk_color, leaf_color);
+    else
+        ai_draw_pine(x, ground_y, height, trunk_color, leaf_color);
+}
+
+/* Mountain with textured rock + gradient snow cap */
+static void ai_draw_mountain(int x, int base_y, int peak_y, int width, uint32_t color, uint32_t snow_color)
+{
+    int height = base_y - peak_y;
+    if (height < 5) return;
+    /* Main mountain body with rocky noise */
+    for (int row = 0; row < height; row++) {
+        int y = peak_y + row;
+        int half_w = (row * (width / 2)) / height;
+        for (int dx = -half_w; dx <= half_w; dx++) {
+            int noise = ai_integer_noise(x + dx, y);
+            int adj = (noise & 0x1F) - 16;
+            uint32_t mc = (adj > 0) ? ai_lighten(color, adj) : ai_darken(color, -adj);
+            artos_canvas_set(x + dx, y, mc);
+        }
+    }
+    /* Snow cap with gradient transition zone */
+    int snow_h = height / 4;
+    int trans_h = height / 8;
+    for (int row = 0; row < snow_h + trans_h; row++) {
+        int y = peak_y + row;
+        int half_w = (row * (width / 2)) / height;
+        for (int dx = -half_w; dx <= half_w; dx++) {
+            if (row < snow_h) {
+                artos_canvas_set(x + dx, y, snow_color);
+            } else {
+                int t = ((row - snow_h) * 256) / (trans_h > 0 ? trans_h : 1);
+                artos_canvas_set(x + dx, y, ai_blend_colors(snow_color, color, t));
+            }
         }
     }
 }
 
-/* Generate AI art from text prompt */
-static void generate_ai_art(void)
+/* Cloud with multi-blob shading */
+static void ai_draw_cloud(int cx, int cy, int size, uint32_t color)
 {
-    if (art.ai_prompt[0] == '\0') return;  /* Empty prompt */
+    uint32_t light = ai_lighten(color, 30);
+    uint32_t dark = ai_darken(color, 20);
+    /* Main body */
+    ai_draw_filled_circle_opacity(cx, cy, size, color, 200);
+    /* Lighter top puffs */
+    ai_draw_filled_circle_opacity(cx - size / 2, cy - size / 3, size * 2 / 3, light, 180);
+    ai_draw_filled_circle_opacity(cx + size / 2, cy - size / 3, size * 2 / 3, light, 170);
+    /* Side puffs */
+    ai_draw_filled_circle_opacity(cx - size, cy + size / 4, size * 3 / 4, color, 160);
+    ai_draw_filled_circle_opacity(cx + size, cy + size / 4, size * 3 / 4, color, 160);
+    /* Bottom shading */
+    ai_draw_filled_circle_opacity(cx, cy + size / 3, size * 3 / 4, dark, 128);
+}
 
-    /* Push current canvas to undo stack */
-    artos_undo_push();
+/* Building with varied windows and optional antenna */
+static void ai_draw_building(int x, int ground_y, int w, int h, uint32_t wall_color, uint32_t window_color)
+{
+    /* Main structure */
+    artos_fill_rect(x, ground_y - h, x + w, ground_y, wall_color);
+    /* Roof line */
+    uint32_t roof = ai_darken(wall_color, 30);
+    artos_fill_rect(x, ground_y - h, x + w, ground_y - h + 2, roof);
+    /* Optional antenna (1 in 3) */
+    if (ai_rand() % 3 == 0) {
+        int ax = x + w / 2;
+        int ah = 8 + (int)(ai_rand() % 12);
+        artos_line(ax, ground_y - h - ah, ax, ground_y - h, wall_color, 1);
+        artos_canvas_set(ax, ground_y - h - ah, 0xFFFF0000);
+    }
+    /* Varied windows: some lit, some dark */
+    int win_w = w / 6; if (win_w < 2) win_w = 2;
+    int win_h = h / 8; if (win_h < 2) win_h = 2;
+    int rows = 2 + h / 30;
+    int cols = 1 + w / 18;
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < cols; col++) {
+            int wx = x + 3 + col * (w - 6) / (cols > 1 ? cols : 1);
+            int wy = ground_y - h + 4 + row * (h - 8) / (rows > 1 ? rows : 1);
+            uint32_t wc = (ai_rand() % 10 < 7) ? window_color : ai_darken(wall_color, 20);
+            artos_fill_rect(wx, wy, wx + win_w, wy + win_h, wc);
+        }
+    }
+}
 
-    /* Seed PRNG with simple hash of prompt */
-    art.ai_rand_seed = 12345;
-    for (int i = 0; art.ai_prompt[i]; i++) {
-        art.ai_rand_seed = art.ai_rand_seed * 31 + (uint32_t)art.ai_prompt[i];
+/* Flower with petals */
+static void ai_draw_flower(int x, int y, int petal_r, uint32_t petal_color, uint32_t center_color)
+{
+    for (int i = 0; i < 6; i++) {
+        int angle = i * 60;
+        int px = x + (icos(angle) * petal_r) / 1024;
+        int py = y + (isin(angle) * petal_r) / 1024;
+        ai_draw_filled_circle(px, py, petal_r * 2 / 3, petal_color);
+    }
+    ai_draw_filled_circle(x, y, petal_r / 2, center_color);
+}
+
+/* Heart shape */
+static void ai_draw_heart(int cx, int cy, int size, uint32_t color)
+{
+    int r = size / 2; if (r < 2) r = 2;
+    ai_draw_filled_circle(cx - r / 2, cy - r / 3, r / 2, color);
+    ai_draw_filled_circle(cx + r / 2, cy - r / 3, r / 2, color);
+    for (int row = 0; row < size; row++) {
+        int half_w = size - row;
+        int yy = cy + row;
+        for (int dx = -half_w; dx <= half_w; dx++)
+            artos_canvas_set(cx + dx, yy, color);
+    }
+}
+
+/* Diamond rhombus */
+static void ai_draw_diamond(int cx, int cy, int size, uint32_t color)
+{
+    for (int row = -size; row <= size; row++) {
+        int half_w = size - (row < 0 ? -row : row);
+        for (int dx = -half_w; dx <= half_w; dx++)
+            artos_canvas_set(cx + dx, cy + row, color);
+    }
+}
+
+/* Sine wave band using isin() */
+static void ai_draw_wave_band(int y_base, int amplitude, int period_px, uint32_t color, int thickness)
+{
+    if (period_px < 1) period_px = 100;
+    for (int x = 0; x < ARTOS_CANVAS_W; x++) {
+        int deg = (x * 360) / period_px;
+        int y = y_base + (isin(deg) * amplitude) / 1024;
+        for (int t = 0; t < thickness; t++)
+            artos_canvas_set(x, y + t, color);
+    }
+}
+
+/* Archimedean spiral */
+static void ai_draw_spiral(int cx, int cy, int max_r, int turns, uint32_t color)
+{
+    int steps = turns * 72;
+    int px = cx, py = cy;
+    for (int i = 1; i <= steps; i++) {
+        int angle = i * 5;
+        int r = (max_r * i) / steps;
+        int nx = cx + (icos(angle) * r) / 1024;
+        int ny = cy + (isin(angle) * r) / 1024;
+        artos_line(px, py, nx, ny, color, 1);
+        px = nx; py = ny;
+    }
+}
+
+/* Recursive fractal branch (max depth 7) */
+static void ai_draw_branch(int x, int y, int len, int angle, int depth, uint32_t color)
+{
+    if (depth <= 0 || len < 3) return;
+    int ex = x + (icos(angle) * len) / 1024;
+    int ey = y + (isin(angle) * len) / 1024;
+    artos_line(x, y, ex, ey, color, 1);
+    ai_draw_branch(ex, ey, len * 2 / 3, angle - 25 - (int)(ai_rand() % 15), depth - 1, color);
+    ai_draw_branch(ex, ey, len * 2 / 3, angle + 25 + (int)(ai_rand() % 15), depth - 1, color);
+}
+
+/*--- Pattern overlay renderer ---*/
+/* --- v3 new element drawing functions --- */
+
+/* Lightning bolt with zigzag and branches */
+static void ai_draw_lightning(int x, int y0, int y1, uint32_t color)
+{
+    int cy = y0, cx = x;
+    uint32_t glow = ai_lighten(color, 60);
+    while (cy < y1) {
+        int nx = cx + (int)(ai_rand() % 20) - 10;
+        int ny = cy + 5 + (int)(ai_rand() % 15);
+        if (ny > y1) ny = y1;
+        artos_line(cx, cy, nx, ny, color, 1);
+        artos_line(cx - 1, cy, nx - 1, ny, glow, 1);
+        artos_line(cx + 1, cy, nx + 1, ny, glow, 1);
+        if (ai_rand() % 3 == 0) {
+            int bx = nx + (int)(ai_rand() % 30) - 15;
+            int by = ny + 10 + (int)(ai_rand() % 20);
+            if (by > y1) by = y1;
+            artos_line(nx, ny, bx, by, ai_darken(color, 40), 1);
+        }
+        cx = nx; cy = ny;
+    }
+}
+
+/* Butterfly with wing circles */
+static void ai_draw_butterfly(int cx, int cy, int size, uint32_t color)
+{
+    artos_line(cx, cy - size / 2, cx, cy + size / 2, ai_darken(color, 60), 1);
+    ai_draw_filled_circle_opacity(cx - size, cy - size / 3, size, color, 180);
+    ai_draw_filled_circle_opacity(cx + size, cy - size / 3, size, color, 180);
+    int lr = size * 2 / 3;
+    ai_draw_filled_circle_opacity(cx - lr, cy + lr / 2, lr, color, 160);
+    ai_draw_filled_circle_opacity(cx + lr, cy + lr / 2, lr, color, 160);
+    uint32_t dot = ai_lighten(color, 80);
+    ai_draw_filled_circle(cx - size, cy - size / 3, size / 3, dot);
+    ai_draw_filled_circle(cx + size, cy - size / 3, size / 3, dot);
+}
+
+/* Bird silhouette (V-shape) */
+static void ai_draw_bird(int cx, int cy, int size, uint32_t color)
+{
+    for (int i = 0; i < size; i++) {
+        int dy = -(isin(i * 90 / (size > 0 ? size : 1)) * size / 2) / 1024;
+        artos_canvas_set(cx - i, cy + dy, color);
+        artos_canvas_set(cx + i, cy + dy, color);
+    }
+}
+
+/* Rainbow arc (7-color ROYGBIV) */
+static void ai_draw_rainbow(int cx, int cy, int radius)
+{
+    uint32_t colors[7] = {
+        0xFFFF0000, 0xFFFF7700, 0xFFFFFF00, 0xFF00CC00,
+        0xFF0000FF, 0xFF4400CC, 0xFF8800AA
+    };
+    for (int b = 0; b < 7; b++) {
+        int r = radius - b * 4;
+        if (r < 5) break;
+        for (int angle = 180; angle <= 360; angle++) {
+            int px = cx + (icos(angle) * r) / 1024;
+            int py = cy + (isin(angle) * r) / 1024;
+            artos_canvas_set_opacity(px, py, colors[b], 160);
+            artos_canvas_set_opacity(px, py + 1, colors[b], 100);
+        }
+    }
+}
+
+/* Planet with shading and ring */
+static void ai_draw_planet(int cx, int cy, int radius, uint32_t color)
+{
+    ai_draw_filled_circle(cx, cy, radius, color);
+    /* Shading on left edge */
+    for (int dy = -radius; dy <= radius; dy++) {
+        int half = isqrt(radius * radius - dy * dy);
+        int shade_w = half / 3;
+        for (int dx = -half; dx < -half + shade_w; dx++)
+            artos_canvas_set_opacity(cx + dx, cy + dy, 0xFF000000, 80);
+    }
+    /* Ring */
+    uint32_t ring_col = ai_lighten(color, 60);
+    for (int angle = 0; angle < 360; angle++) {
+        int rx = (icos(angle) * (radius + radius / 2)) / 1024;
+        int ry = (isin(angle) * (radius / 3)) / 1024;
+        if (ry > 0 || rx < -radius / 2 || rx > radius / 2)
+            artos_canvas_set_opacity(cx + rx, cy + ry, ring_col, 180);
+    }
+}
+
+/* Lighthouse with red/white stripes and beam */
+static void ai_draw_lighthouse(int x, int ground_y, int height, uint32_t color)
+{
+    (void)color;
+    int bw = height / 4, tw = height / 8;
+    for (int row = 0; row < height; row++) {
+        int hw = bw - ((bw - tw) * row) / (height > 0 ? height : 1);
+        int y = ground_y - row;
+        uint32_t rc = (row / 8) % 2 ? 0xFFFF0000 : 0xFFFFFFFF;
+        for (int dx = -hw; dx <= hw; dx++)
+            artos_canvas_set(x + dx, y, rc);
+    }
+    int top_y = ground_y - height;
+    artos_fill_rect(x - tw - 2, top_y - 6, x + tw + 2, top_y, 0xFF333333);
+    ai_draw_filled_circle_opacity(x, top_y - 3, 4, 0xFFFFFF00, 200);
+    for (int angle = 150; angle <= 210; angle += 10) {
+        int ex = x + (icos(angle) * 50) / 1024;
+        int ey = (top_y - 3) + (isin(angle) * 50) / 1024;
+        artos_line(x, top_y - 3, ex, ey, 0xFFFFFF44, 1);
+    }
+}
+
+/* Boat with hull, mast and sail */
+static void ai_draw_boat(int cx, int water_y, int size, uint32_t color)
+{
+    int hw = size, twid = size / 2, hull_h = size / 2;
+    for (int row = 0; row < hull_h; row++) {
+        int w = twid + ((hw - twid) * row) / (hull_h > 0 ? hull_h : 1);
+        int y = water_y - hull_h + row;
+        for (int dx = -w; dx <= w; dx++)
+            artos_canvas_set(cx + dx, y, color);
+    }
+    int mast_h = size;
+    artos_line(cx, water_y - hull_h - mast_h, cx, water_y - hull_h, 0xFF4B3621, 1);
+    for (int row = 0; row < mast_h; row++) {
+        int sail_w = (mast_h - row) * size / (mast_h > 0 ? mast_h : 1);
+        int y = water_y - hull_h - mast_h + row;
+        for (int dx = 1; dx <= sail_w; dx++)
+            artos_canvas_set(cx + dx, y, 0xFFFFFFFF);
+    }
+}
+
+/* Windmill with tapered tower and 4 blades */
+static void ai_draw_windmill(int x, int ground_y, int height, uint32_t color)
+{
+    int bw = height / 5, tw = height / 8;
+    for (int row = 0; row < height; row++) {
+        int hw = bw - ((bw - tw) * row) / (height > 0 ? height : 1);
+        int y = ground_y - row;
+        for (int dx = -hw; dx <= hw; dx++)
+            artos_canvas_set(x + dx, y, color);
+    }
+    int hub_y = ground_y - height;
+    int blade_len = height * 2 / 3;
+    int offset = (int)(ai_rand() % 90);
+    for (int b = 0; b < 4; b++) {
+        int angle = offset + b * 90;
+        int ex = x + (icos(angle) * blade_len) / 1024;
+        int ey = hub_y + (isin(angle) * blade_len) / 1024;
+        artos_line(x, hub_y, ex, ey, 0xFF666666, 1);
+        int px = -(isin(angle) * 3) / 1024;
+        int py = (icos(angle) * 3) / 1024;
+        artos_line(x + px, hub_y + py, ex + px, ey + py, 0xFF888888, 1);
+    }
+    ai_draw_filled_circle(x, hub_y, 3, 0xFF555555);
+}
+
+/* Ground texture: sparse noise dots for grass/sand/snow */
+static void ai_draw_ground_texture(int hy, uint32_t base_color, int theme)
+{
+    for (int y = hy; y < ARTOS_CANVAS_H; y += 2) {
+        for (int x = 0; x < ARTOS_CANVAS_W; x += 2) {
+            int noise = ai_integer_noise(x + 1000, y + 2000);
+            if (noise > 200) {
+                uint32_t tc;
+                if (theme == AI_THEME_DESERT || theme == AI_THEME_BEACH)
+                    tc = ai_lighten(base_color, noise & 0x1F);
+                else if (theme == AI_THEME_WINTER || theme == AI_THEME_ARCTIC)
+                    tc = 0xFFFFFFFF;
+                else
+                    tc = ai_darken(base_color, 20 + (noise & 0x0F));
+                artos_canvas_set_opacity(x, y, tc, 120);
+            }
+        }
+    }
+}
+
+/* Water reflection: mirror above-horizon into water with ripple */
+static void ai_draw_water_reflection(int horizon_y, uint32_t water_tint)
+{
+    int reflect_h = ARTOS_CANVAS_H - horizon_y;
+    if (reflect_h <= 0) return;
+    for (int row = 0; row < reflect_h; row++) {
+        int src_y = horizon_y - 1 - row;
+        int dst_y = horizon_y + row;
+        if (src_y < 0 || dst_y >= ARTOS_CANVAS_H) break;
+        int ripple = (isin(row * 12) * (1 + row / 20)) / 1024;
+        for (int x = 0; x < ARTOS_CANVAS_W; x++) {
+            int sx = x + ripple;
+            if (sx < 0) sx = 0;
+            if (sx >= ARTOS_CANVAS_W) sx = ARTOS_CANVAS_W - 1;
+            uint32_t src = artos_canvas_get(sx, src_y);
+            uint32_t dark = ai_darken(src, 40 + row / 3);
+            uint32_t reflected = ai_blend_colors(dark, water_tint, 80 + row);
+            artos_canvas_set_opacity(x, dst_y, reflected, 180);
+        }
+    }
+}
+
+/* Biased random X for centered composition */
+static int ai_centered_x(int composition)
+{
+    if (composition == AI_COMP_CENTERED) {
+        int a = (int)(ai_rand() % ARTOS_CANVAS_W);
+        int b = (int)(ai_rand() % ARTOS_CANVAS_W);
+        return (a + b) / 2;
+    }
+    return (int)(ai_rand() % ARTOS_CANVAS_W);
+}
+
+static void ai_render_pattern(struct ai_scene *sc)
+{
+    uint32_t c1 = sc->pal.accent1;
+    uint32_t c2 = sc->pal.accent2;
+    int d = sc->density;
+
+    switch (sc->pattern) {
+    case AI_PAT_CIRCLES:
+        for (int i = 0; i < d; i++) {
+            int cx = ai_rand() % ARTOS_CANVAS_W;
+            int cy = ai_rand() % ARTOS_CANVAS_H;
+            int r = 5 + (int)(ai_rand() % 16);
+            artos_ellipse(cx, cy, r, r, c1);
+        }
+        break;
+    case AI_PAT_SQUARES:
+        for (int i = 0; i < d; i++) {
+            int x = ai_rand() % ARTOS_CANVAS_W;
+            int y = ai_rand() % ARTOS_CANVAS_H;
+            int sz = 5 + (int)(ai_rand() % 16);
+            if (ai_rand() % 2)
+                artos_fill_rect(x, y, x + sz, y + sz, c1);
+            else
+                artos_rect(x, y, x + sz, y + sz, c1);
+        }
+        break;
+    case AI_PAT_LINES:
+        for (int i = 0; i < d; i++) {
+            int x0 = ai_rand() % ARTOS_CANVAS_W;
+            artos_line(x0, 0, x0, ARTOS_CANVAS_H - 1, c1, 1);
+        }
+        break;
+    case AI_PAT_DOTS:
+        for (int i = 0; i < d * 2; i++) {
+            int x = ai_rand() % ARTOS_CANVAS_W;
+            int y = ai_rand() % ARTOS_CANVAS_H;
+            artos_plot(x, y, c1, 1 + (int)(ai_rand() % 3));
+        }
+        break;
+    case AI_PAT_WAVES:
+        for (int w = 0; w < d / 5 + 1; w++) {
+            int amp = 10 + (int)(ai_rand() % 20);
+            int yoff = ai_rand() % ARTOS_CANVAS_H;
+            ai_draw_wave_band(yoff, amp, 80 + (int)(ai_rand() % 60), c1, 1);
+        }
+        break;
+    case AI_PAT_SPIRAL:
+        ai_draw_spiral(ARTOS_CANVAS_W / 2, ARTOS_CANVAS_H / 2, 100, 3, c1);
+        break;
+    case AI_PAT_CHECKER: {
+        int sz = (sc->style == AI_STYLE_PIXEL) ? 16 : 20;
+        for (int y = 0; y < ARTOS_CANVAS_H; y += sz)
+            for (int x = 0; x < ARTOS_CANVAS_W; x += sz)
+                if (((x / sz) + (y / sz)) % 2)
+                    artos_fill_rect(x, y, x + sz - 1, y + sz - 1, c1);
+        break;
+    }
+    case AI_PAT_NOISE:
+        for (int y = 0; y < ARTOS_CANVAS_H; y += 2)
+            for (int x = 0; x < ARTOS_CANVAS_W; x += 2) {
+                int v = ai_integer_noise(x, y);
+                uint32_t nc = (v > 128) ? c1 : c2;
+                artos_canvas_set_opacity(x, y, nc, 80);
+                artos_canvas_set_opacity(x + 1, y, nc, 80);
+                artos_canvas_set_opacity(x, y + 1, nc, 80);
+                artos_canvas_set_opacity(x + 1, y + 1, nc, 80);
+            }
+        break;
+    case AI_PAT_RADIAL: {
+        int rays = 12 + d;
+        for (int i = 0; i < rays; i++) {
+            int angle = (i * 360) / rays;
+            int len = 80 + (int)(ai_rand() % 80);
+            int ex = ARTOS_CANVAS_W / 2 + (icos(angle) * len) / 1024;
+            int ey = ARTOS_CANVAS_H / 2 + (isin(angle) * len) / 1024;
+            artos_line(ARTOS_CANVAS_W / 2, ARTOS_CANVAS_H / 2, ex, ey, c1, 1);
+        }
+        break;
+    }
+    case AI_PAT_GRID:
+        for (int y = 0; y < ARTOS_CANVAS_H; y += 20)
+            artos_line(0, y, ARTOS_CANVAS_W - 1, y, c1, 1);
+        for (int x = 0; x < ARTOS_CANVAS_W; x += 20)
+            artos_line(x, 0, x, ARTOS_CANVAS_H - 1, c1, 1);
+        break;
+    case AI_PAT_CROSSHATCH:
+        for (int i = -ARTOS_CANVAS_H; i < ARTOS_CANVAS_W; i += 15) {
+            artos_line(i, 0, i + ARTOS_CANVAS_H, ARTOS_CANVAS_H - 1, c1, 1);
+            artos_line(i + ARTOS_CANVAS_H, 0, i, ARTOS_CANVAS_H - 1, c2, 1);
+        }
+        break;
+    case AI_PAT_ZIGZAG:
+        for (int band = 0; band < 6; band++) {
+            int by = 20 + band * 45;
+            for (int x = 0; x < ARTOS_CANVAS_W - 20; x += 20)
+                artos_line(x, by + ((x / 20) % 2) * 20,
+                           x + 20, by + (((x / 20) + 1) % 2) * 20, c1, 1);
+        }
+        break;
+    case AI_PAT_RINGS:
+        for (int r = 10; r < 150; r += 12)
+            artos_ellipse(ARTOS_CANVAS_W / 2, ARTOS_CANVAS_H / 2, r, r,
+                          (r / 12 % 2) ? c1 : c2);
+        break;
+    case AI_PAT_BRANCH:
+        ai_draw_branch(ARTOS_CANVAS_W / 2, ARTOS_CANVAS_H - 1, 60, 270, 7, c1);
+        break;
+    }
+}
+
+/*--- Groq AI Proxy: VirtIO Console integration ---*/
+
+/* Forward declarations for Groq integration */
+static void generate_ai_art_local(void);
+static void generate_ai_art_from_scene(struct ai_scene *sc);
+
+/*--- COM2 serial I/O for Groq AI proxy ---*/
+#define GROQ_COM2       0x2F8
+#define GROQ_COM2_DATA  0
+#define GROQ_COM2_IER   1
+#define GROQ_COM2_FCR   2
+#define GROQ_COM2_LCR   3
+#define GROQ_COM2_MCR   4
+#define GROQ_COM2_LSR   5
+
+static int groq_serial_ready = 0;
+
+static void groq_serial_init(void)
+{
+    outb(GROQ_COM2 + GROQ_COM2_IER, 0x00);
+    outb(GROQ_COM2 + GROQ_COM2_LCR, 0x80);
+    outb(GROQ_COM2 + GROQ_COM2_DATA, 0x01);  /* 115200 baud */
+    outb(GROQ_COM2 + GROQ_COM2_IER, 0x00);
+    outb(GROQ_COM2 + GROQ_COM2_LCR, 0x03);   /* 8N1 */
+    outb(GROQ_COM2 + GROQ_COM2_FCR, 0xC7);   /* Enable FIFO */
+    outb(GROQ_COM2 + GROQ_COM2_MCR, 0x0B);
+    /* Loopback test */
+    outb(GROQ_COM2 + GROQ_COM2_MCR, 0x1E);
+    outb(GROQ_COM2 + GROQ_COM2_DATA, 0xAE);
+    if (inb(GROQ_COM2 + GROQ_COM2_DATA) != 0xAE) {
+        kprintf("[Groq] COM2 not available\n");
+        return;
+    }
+    outb(GROQ_COM2 + GROQ_COM2_MCR, 0x0F);
+    groq_serial_ready = 1;
+    kprintf("[Groq] COM2 serial initialized\n");
+}
+
+static void groq_serial_write(const char *buf, int len)
+{
+    for (int i = 0; i < len; i++) {
+        while (!(inb(GROQ_COM2 + GROQ_COM2_LSR) & 0x20))
+            ;
+        outb(GROQ_COM2 + GROQ_COM2_DATA, (uint8_t)buf[i]);
+    }
+}
+
+static int groq_serial_read(char *buf, int max)
+{
+    int n = 0;
+    while (n < max && (inb(GROQ_COM2 + GROQ_COM2_LSR) & 0x01))
+        buf[n++] = (char)inb(GROQ_COM2 + GROQ_COM2_DATA);
+    return n;
+}
+
+/* Send prompt to Groq AI proxy via COM2 serial */
+static void groq_send_prompt(const char *prompt)
+{
+    char buf[128];
+    int len = 0;
+    buf[len++] = 'G'; buf[len++] = 'R'; buf[len++] = 'O';
+    buf[len++] = 'Q'; buf[len++] = ':';
+    for (int i = 0; prompt[i] && len < 126; i++)
+        buf[len++] = prompt[i];
+    buf[len++] = '\n';
+    groq_serial_write(buf, len);
+}
+
+/* Find value for key in "key=val;key=val" string */
+static const char *groq_find_value(const char *resp, const char *key)
+{
+    int klen = (int)strlen(key);
+    const char *p = resp;
+    while (*p) {
+        if (strncmp(p, key, (size_t)klen) == 0 && p[klen] == '=')
+            return p + klen + 1;
+        while (*p && *p != ';') p++;
+        if (*p == ';') p++;
+    }
+    return NULL;
+}
+
+/* Extract value stopping at ; or end */
+static int groq_extract_value(const char *val, char *out, int max)
+{
+    int i = 0;
+    while (val[i] && val[i] != ';' && i < max - 1) {
+        out[i] = val[i]; i++;
+    }
+    out[i] = '\0';
+    return i;
+}
+
+/* Map theme name to AI_THEME_* */
+static int groq_theme_id(const char *n)
+{
+    if (strncmp(n, "sunset", 6) == 0) return AI_THEME_SUNSET;
+    if (strncmp(n, "ocean", 5) == 0) return AI_THEME_OCEAN;
+    if (strncmp(n, "forest", 6) == 0) return AI_THEME_FOREST;
+    if (strncmp(n, "night", 5) == 0) return AI_THEME_NIGHT;
+    if (strncmp(n, "desert", 6) == 0) return AI_THEME_DESERT;
+    if (strncmp(n, "fire", 4) == 0) return AI_THEME_FIRE;
+    if (strncmp(n, "sky", 3) == 0) return AI_THEME_SKY;
+    if (strncmp(n, "galaxy", 6) == 0) return AI_THEME_GALAXY;
+    if (strncmp(n, "rainbow", 7) == 0) return AI_THEME_RAINBOW;
+    if (strncmp(n, "pastel", 6) == 0) return AI_THEME_PASTEL;
+    if (strncmp(n, "autumn", 6) == 0) return AI_THEME_AUTUMN;
+    if (strncmp(n, "winter", 6) == 0) return AI_THEME_WINTER;
+    if (strncmp(n, "spring", 6) == 0) return AI_THEME_SPRING;
+    if (strncmp(n, "neon", 4) == 0) return AI_THEME_NEON;
+    if (strncmp(n, "mono", 4) == 0) return AI_THEME_MONO;
+    if (strncmp(n, "gold", 4) == 0) return AI_THEME_GOLD;
+    if (strncmp(n, "lavender", 8) == 0) return AI_THEME_LAVENDER;
+    if (strncmp(n, "coral", 5) == 0) return AI_THEME_CORAL;
+    if (strncmp(n, "aurora", 6) == 0) return AI_THEME_AURORA;
+    if (strncmp(n, "underwater", 10) == 0) return AI_THEME_UNDERWATER;
+    if (strncmp(n, "volcano", 7) == 0) return AI_THEME_VOLCANO;
+    if (strncmp(n, "cyberpunk", 9) == 0) return AI_THEME_CYBERPUNK;
+    if (strncmp(n, "jungle", 6) == 0) return AI_THEME_JUNGLE;
+    if (strncmp(n, "arctic", 6) == 0) return AI_THEME_ARCTIC;
+    if (strncmp(n, "meadow", 6) == 0) return AI_THEME_MEADOW;
+    if (strncmp(n, "storm", 5) == 0) return AI_THEME_STORM;
+    if (strncmp(n, "twilight", 8) == 0) return AI_THEME_TWILIGHT;
+    if (strncmp(n, "cave", 4) == 0) return AI_THEME_CAVE;
+    if (strncmp(n, "beach", 5) == 0) return AI_THEME_BEACH;
+    return AI_THEME_DEFAULT;
+}
+
+/* Map element name to AI_ELEM_* (-1 if unknown) */
+static int groq_elem_id(const char *n, int len)
+{
+    if (len == 3 && strncmp(n, "sun", 3) == 0) return AI_ELEM_SUN;
+    if (len == 4 && strncmp(n, "moon", 4) == 0) return AI_ELEM_MOON;
+    if (len >= 4 && strncmp(n, "star", 4) == 0) return AI_ELEM_STARS;
+    if (len >= 5 && strncmp(n, "cloud", 5) == 0) return AI_ELEM_CLOUDS;
+    if (len >= 8 && strncmp(n, "mountain", 8) == 0) return AI_ELEM_MOUNTAINS;
+    if (len >= 4 && strncmp(n, "tree", 4) == 0) return AI_ELEM_TREES;
+    if (len >= 5 && strncmp(n, "water", 5) == 0) return AI_ELEM_WATER;
+    if (len == 4 && strncmp(n, "rain", 4) == 0) return AI_ELEM_RAIN;
+    if (len == 4 && strncmp(n, "snow", 4) == 0) return AI_ELEM_SNOW;
+    if (len >= 8 && strncmp(n, "building", 8) == 0) return AI_ELEM_BUILDINGS;
+    if (len >= 6 && strncmp(n, "flower", 6) == 0) return AI_ELEM_FLOWERS;
+    if (len >= 5 && strncmp(n, "heart", 5) == 0) return AI_ELEM_HEARTS;
+    if (len >= 7 && strncmp(n, "diamond", 7) == 0) return AI_ELEM_DIAMONDS;
+    if (len >= 4 && strncmp(n, "fire", 4) == 0) return AI_ELEM_FIRE_FX;
+    if (len >= 6 && strncmp(n, "aurora", 6) == 0) return AI_ELEM_AURORA;
+    if (len >= 9 && strncmp(n, "lightning", 9) == 0) return AI_ELEM_LIGHTNING;
+    if (len >= 9 && strncmp(n, "butterfl", 8) == 0) return AI_ELEM_BUTTERFLIES;
+    if (len >= 4 && strncmp(n, "bird", 4) == 0) return AI_ELEM_BIRDS;
+    if (len >= 7 && strncmp(n, "rainbow", 7) == 0) return AI_ELEM_RAINBOW;
+    if (len >= 6 && strncmp(n, "planet", 6) == 0) return AI_ELEM_PLANETS;
+    if (len >= 10 && strncmp(n, "lighthouse", 10) == 0) return AI_ELEM_LIGHTHOUSE;
+    if (len >= 4 && strncmp(n, "boat", 4) == 0) return AI_ELEM_BOATS;
+    if (len >= 8 && strncmp(n, "windmill", 8) == 0) return AI_ELEM_WINDMILL;
+    return -1;
+}
+
+/* Map style name to AI_STYLE_* */
+static int groq_style_id(const char *n)
+{
+    if (strncmp(n, "abstract", 8) == 0) return AI_STYLE_ABSTRACT;
+    if (strncmp(n, "geometric", 9) == 0) return AI_STYLE_GEOMETRIC;
+    if (strncmp(n, "organic", 7) == 0) return AI_STYLE_ORGANIC;
+    if (strncmp(n, "minimal", 7) == 0) return AI_STYLE_MINIMAL;
+    if (strncmp(n, "chaotic", 7) == 0) return AI_STYLE_CHAOTIC;
+    if (strncmp(n, "pixel", 5) == 0) return AI_STYLE_PIXEL;
+    return AI_STYLE_NORMAL;
+}
+
+/* Map composition name to AI_COMP_* */
+static int groq_comp_id(const char *n)
+{
+    if (strncmp(n, "panoramic", 9) == 0) return AI_COMP_PANORAMIC;
+    if (strncmp(n, "tall", 4) == 0) return AI_COMP_TALL;
+    if (strncmp(n, "centered", 8) == 0) return AI_COMP_CENTERED;
+    return AI_COMP_NORMAL;
+}
+
+/* Parse SCENE response into struct ai_scene */
+static struct ai_scene groq_parse_scene(const char *resp)
+{
+    struct ai_scene sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.theme = AI_THEME_DEFAULT;
+    sc.style = AI_STYLE_NORMAL;
+    sc.pattern = -1;
+    sc.density = 15;
+    sc.brightness = 1;
+    sc.horizon_y = 150;
+    sc.has_ground = 0;
+    sc.elem_count = 0;
+    sc.composition = AI_COMP_NORMAL;
+    sc.color_override = 0;
+
+    char vb[64];
+    const char *v;
+
+    v = groq_find_value(resp, "theme");
+    if (v) { groq_extract_value(v, vb, 64); sc.theme = groq_theme_id(vb); }
+
+    v = groq_find_value(resp, "style");
+    if (v) { groq_extract_value(v, vb, 64); sc.style = groq_style_id(vb); }
+
+    v = groq_find_value(resp, "comp");
+    if (v) { groq_extract_value(v, vb, 64); sc.composition = groq_comp_id(vb); }
+
+    v = groq_find_value(resp, "density");
+    if (v) { int d = (int)strtoul(v, NULL, 10); if (d >= 5 && d <= 30) sc.density = d; }
+
+    v = groq_find_value(resp, "bright");
+    if (v) { int b = (int)strtoul(v, NULL, 10); if (b >= 0 && b <= 2) sc.brightness = b; }
+
+    v = groq_find_value(resp, "horizon");
+    if (v) { int h = (int)strtoul(v, NULL, 10); if (h >= 0 && h <= ARTOS_CANVAS_H) sc.horizon_y = h; }
+
+    v = groq_find_value(resp, "color");
+    if (v) {
+        unsigned long c = strtoul(v, NULL, 16);
+        if (c > 0 && c <= 0xFFFFFF) sc.color_override = 0xFF000000 | (uint32_t)c;
     }
 
-    /* Parse keywords */
-    struct ai_keywords kw = parse_ai_keywords(art.ai_prompt);
+    /* Parse elements: "elems=sun,mountains,clouds" */
+    v = groq_find_value(resp, "elems");
+    if (v) {
+        const char *p = v;
+        while (*p && *p != ';') {
+            const char *start = p;
+            while (*p && *p != ',' && *p != ';') p++;
+            int elen = (int)(p - start);
+            if (elen > 0) {
+                int eid = groq_elem_id(start, elen);
+                if (eid >= 0) ai_scene_add_elem(&sc, eid);
+                if (eid == AI_ELEM_MOUNTAINS || eid == AI_ELEM_TREES ||
+                    eid == AI_ELEM_BUILDINGS || eid == AI_ELEM_FLOWERS ||
+                    eid == AI_ELEM_LIGHTHOUSE || eid == AI_ELEM_WINDMILL)
+                    sc.has_ground = 1;
+            }
+            if (*p == ',') p++;
+        }
+    }
 
-    /* Apply background */
-    if (kw.pattern_type == AI_PATTERN_GRADIENT) {
-        if (kw.direction == AI_DIR_VERTICAL) {
-            artos_fill_gradient_v(kw.base_color, kw.accent_color);
-        } else {
-            /* Horizontal gradient - rotate logic */
-            for (int x = 0; x < ARTOS_CANVAS_W; x++) {
-                uint8_t r1 = (kw.base_color >> 16) & 0xFF;
-                uint8_t g1 = (kw.base_color >> 8) & 0xFF;
-                uint8_t b1 = kw.base_color & 0xFF;
-                uint8_t r2 = (kw.accent_color >> 16) & 0xFF;
-                uint8_t g2 = (kw.accent_color >> 8) & 0xFF;
-                uint8_t b2 = kw.accent_color & 0xFF;
-                uint8_t r = r1 + ((r2 - r1) * x) / ARTOS_CANVAS_W;
-                uint8_t g = g1 + ((g2 - g1) * x) / ARTOS_CANVAS_W;
-                uint8_t b = b1 + ((b2 - b1) * x) / ARTOS_CANVAS_W;
-                uint32_t color = 0xFF000000 | (r << 16) | (g << 8) | b;
-                for (int y = 0; y < ARTOS_CANVAS_H; y++) {
-                    artos_canvas_set(x, y, color);
+    /* Set palette from theme */
+    sc.pal = ai_palettes[sc.theme];
+    if (sc.brightness != 1)
+        sc.pal = ai_adjust_palette(sc.pal, sc.brightness);
+    if (sc.color_override != 0)
+        sc.pal = ai_tint_accents(sc.pal, sc.color_override);
+
+    return sc;
+}
+
+/* Poll VirtIO Console for Groq response */
+static void groq_poll_response(void)
+{
+    if (!art.groq_pending) return;
+
+    char tmp[256];
+    int n = groq_serial_read(tmp, (int)sizeof(tmp));
+    if (n <= 0) return;
+
+    for (int i = 0; i < n && art.groq_resp_len < 511; i++)
+        art.groq_response[art.groq_resp_len++] = tmp[i];
+    art.groq_response[art.groq_resp_len] = '\0';
+
+    /* Look for complete line */
+    char *nl = strchr(art.groq_response, '\n');
+    if (!nl) return;
+    *nl = '\0';
+
+    if (strncmp(art.groq_response, "SCENE:", 6) == 0) {
+        /* Parse and render */
+        artos_undo_push();
+        art.ai_rand_seed = 12345;
+        for (int i = 0; art.ai_prompt[i]; i++)
+            art.ai_rand_seed = art.ai_rand_seed * 31 + (uint32_t)art.ai_prompt[i];
+        struct ai_scene sc = groq_parse_scene(art.groq_response + 6);
+        generate_ai_art_from_scene(&sc);
+        art.modified = 1;
+        art.groq_pending = 0;
+        strcpy(art.groq_status, "Groq done!");
+        kprintf("[ArtOS] Groq scene rendered\n");
+        return;
+    }
+
+    if (strncmp(art.groq_response, "GROQ_ERR:", 9) == 0) {
+        art.groq_pending = 0;
+        strcpy(art.groq_status, "Groq error");
+        kprintf("[ArtOS] Groq error: %s\n", art.groq_response + 9);
+        generate_ai_art_local();
+        return;
+    }
+
+    /* Discard non-protocol line (kprintf noise) */
+    int consumed = (int)(nl - art.groq_response) + 1;
+    int remaining = art.groq_resp_len - consumed;
+    if (remaining > 0)
+        memmove(art.groq_response, nl + 1, (size_t)remaining);
+    art.groq_resp_len = remaining;
+    art.groq_response[remaining] = '\0';
+}
+
+/*--- AI Art Generator v2: 5-pass scene composition pipeline ---*/
+static void generate_ai_art_from_scene(struct ai_scene *sc)
+{
+    int hy = sc->horizon_y;
+
+    /* === PASS 1: Background === */
+    if (sc->theme == AI_THEME_CAVE) {
+        /* Cave: dark gradient with stalactites and stalagmites */
+        ai_draw_gradient_band(0, ARTOS_CANVAS_H, sc->pal.sky_top, sc->pal.sky_bottom);
+        for (int i = 0; i < 12; i++) {
+            int sx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int sh = 15 + (int)(ai_rand() % 40);
+            int sw = 3 + (int)(ai_rand() % 8);
+            uint32_t sc_col = ai_lighten(sc->pal.ground, 15);
+            for (int row = 0; row < sh; row++) {
+                int hw2 = sw - (sw * row) / (sh > 0 ? sh : 1);
+                for (int dx = -hw2; dx <= hw2; dx++)
+                    artos_canvas_set(sx + dx, row, sc_col);
+            }
+        }
+        for (int i = 0; i < 8; i++) {
+            int sx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int sh = 10 + (int)(ai_rand() % 30);
+            int sw = 3 + (int)(ai_rand() % 6);
+            uint32_t sc_col = ai_lighten(sc->pal.ground, 10);
+            for (int row = 0; row < sh; row++) {
+                int hw2 = sw - (sw * row) / (sh > 0 ? sh : 1);
+                for (int dx = -hw2; dx <= hw2; dx++)
+                    artos_canvas_set(sx + dx, ARTOS_CANVAS_H - 1 - row, sc_col);
+            }
+        }
+    } else if (sc->theme == AI_THEME_UNDERWATER) {
+        /* Underwater: full water gradient with caustic light */
+        ai_draw_gradient_band(0, ARTOS_CANVAS_H, sc->pal.sky_top, sc->pal.sky_bottom);
+        for (int ux = 0; ux < ARTOS_CANVAS_W; ux++) {
+            for (int uy = 0; uy < 80; uy++) {
+                int wave = (isin(ux * 7 + uy * 3) * isin(ux * 3 - uy * 5)) / (1024 * 1024);
+                if (wave > 0) {
+                    int alpha = wave * 60 / 1024;
+                    if (alpha > 255) alpha = 255;
+                    artos_canvas_set_opacity(ux, uy, 0xFFAADDFF, alpha);
                 }
             }
         }
+        /* Bubbles */
+        for (int i = 0; i < 15; i++) {
+            int bx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int by2 = (int)(ai_rand() % ARTOS_CANVAS_H);
+            int br = 2 + (int)(ai_rand() % 4);
+            artos_ellipse(bx, by2, br, br, 0xFFAADDFF);
+            artos_canvas_set_opacity(bx - 1, by2 - 1, 0xFFFFFFFF, 100);
+        }
+    } else if (sc->has_ground) {
+        ai_draw_gradient_band(0, hy, sc->pal.sky_top, sc->pal.sky_bottom);
+        ai_draw_gradient_band(hy, ARTOS_CANVAS_H, sc->pal.ground, ai_darken(sc->pal.ground, 30));
     } else {
-        /* Solid background */
-        artos_fill_rect(0, 0, ARTOS_CANVAS_W - 1, ARTOS_CANVAS_H - 1, kw.base_color);
+        ai_draw_gradient_band(0, ARTOS_CANVAS_H, sc->pal.sky_top, sc->pal.sky_bottom);
+    }
+    /* Ground texture */
+    if (sc->has_ground && sc->theme != AI_THEME_UNDERWATER && sc->theme != AI_THEME_CAVE)
+        ai_draw_ground_texture(hy, sc->pal.ground, sc->theme);
+
+    /* === PASS 2: Far background (mountains, buildings, lighthouse, windmill) === */
+    if (ai_scene_has(sc, AI_ELEM_MOUNTAINS)) {
+        int count = 3 + (int)(ai_rand() % 3);
+        for (int i = 0; i < count; i++) {
+            int mx = ai_centered_x(sc->composition);
+            int mw = 100 + (int)(ai_rand() % 120);
+            int peak = hy - 40 - (int)(ai_rand() % 60);
+            /* Atmospheric depth: farther mountains tinted toward sky */
+            int depth = 160 - i * 50;
+            if (depth < 0) depth = 0;
+            uint32_t mcol = ai_depth_tint(
+                ai_blend_colors(sc->pal.ground, sc->pal.sky_bottom, 80 + i * 40),
+                sc->pal.sky_bottom, depth);
+            ai_draw_mountain(mx, hy, peak, mw, mcol, 0xFFFFFFFF);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_BUILDINGS)) {
+        int count = 4 + (int)(ai_rand() % 5);
+        int night = (sc->theme == AI_THEME_NIGHT || sc->theme == AI_THEME_NEON
+                     || sc->theme == AI_THEME_GALAXY || sc->theme == AI_THEME_CYBERPUNK);
+        uint32_t wincol = night ? 0xFFFFFF00 : 0xFF87CEEB;
+        if (sc->theme == AI_THEME_CYBERPUNK)
+            wincol = (ai_rand() % 2) ? 0xFF00FFFF : 0xFFFF00FF;
+        for (int i = 0; i < count; i++) {
+            int bx = i * (ARTOS_CANVAS_W / count) + (int)(ai_rand() % 20);
+            int bw = 20 + (int)(ai_rand() % 30);
+            int bh = 40 + (int)(ai_rand() % 80);
+            uint32_t wcol = ai_blend_colors(sc->pal.ground, sc->pal.accent1, 100);
+            ai_draw_building(bx, hy, bw, bh, wcol, wincol);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_LIGHTHOUSE)) {
+        int lx = 60 + (int)(ai_rand() % 100);
+        int lh = 50 + (int)(ai_rand() % 20);
+        ai_draw_lighthouse(lx, hy, lh, 0xFFDDDDDD);
+    }
+    if (ai_scene_has(sc, AI_ELEM_WINDMILL)) {
+        int wx = ARTOS_CANVAS_W / 2 + (int)(ai_rand() % 80) - 40;
+        int wh = 40 + (int)(ai_rand() % 20);
+        ai_draw_windmill(wx, hy, wh, 0xFFBBAA88);
     }
 
-    /* Apply pattern overlay */
-    switch (kw.pattern_type) {
-        case AI_PATTERN_CIRCLES:
-            for (int i = 0; i < kw.density; i++) {
-                int cx = ai_rand() % ARTOS_CANVAS_W;
-                int cy = ai_rand() % ARTOS_CANVAS_H;
-                int r = 5 + (ai_rand() % 16);  /* Radius 5-20 */
-                artos_ellipse(cx, cy, r, r, kw.accent_color);
-            }
-            break;
-
-        case AI_PATTERN_SQUARES:
-            for (int i = 0; i < kw.density; i++) {
-                int x = ai_rand() % ARTOS_CANVAS_W;
-                int y = ai_rand() % ARTOS_CANVAS_H;
-                int size = 5 + (ai_rand() % 16);
-                int filled = (ai_rand() % 2);
-                if (filled) {
-                    artos_fill_rect(x, y, x + size, y + size, kw.accent_color);
-                } else {
-                    artos_rect(x, y, x + size, y + size, kw.accent_color);
-                }
-            }
-            break;
-
-        case AI_PATTERN_LINES:
-            for (int i = 0; i < kw.density; i++) {
-                int x0, y0, x1, y1;
-                if (kw.direction == AI_DIR_VERTICAL) {
-                    x0 = ai_rand() % ARTOS_CANVAS_W;
-                    x1 = x0;
-                    y0 = 0;
-                    y1 = ARTOS_CANVAS_H - 1;
-                } else {
-                    y0 = ai_rand() % ARTOS_CANVAS_H;
-                    y1 = y0;
-                    x0 = 0;
-                    x1 = ARTOS_CANVAS_W - 1;
-                }
-                artos_line(x0, y0, x1, y1, kw.accent_color, 1);
-            }
-            break;
-
-        case AI_PATTERN_DOTS:
-            for (int i = 0; i < kw.density * 2; i++) {
-                int x = ai_rand() % ARTOS_CANVAS_W;
-                int y = ai_rand() % ARTOS_CANVAS_H;
-                int size = 1 + (ai_rand() % 3);
-                artos_plot(x, y, kw.accent_color, size);
-            }
-            break;
-
-        case AI_PATTERN_WAVES:
-            /* Sine wave approximation using line segments */
-            for (int w = 0; w < kw.density / 5 + 1; w++) {
-                int amplitude = 10 + (ai_rand() % 20);
-                int y_offset = ai_rand() % ARTOS_CANVAS_H;
-                for (int x = 0; x < ARTOS_CANVAS_W - 1; x++) {
-                    /* Approximate sine with simple periodic function */
-                    int y1 = y_offset + (amplitude * ((x * 360 / ARTOS_CANVAS_W) % 180 < 90 ? 1 : -1) * (x % (ARTOS_CANVAS_W / 4))) / (ARTOS_CANVAS_W / 4);
-                    int y2 = y_offset + (amplitude * (((x + 1) * 360 / ARTOS_CANVAS_W) % 180 < 90 ? 1 : -1) * ((x + 1) % (ARTOS_CANVAS_W / 4))) / (ARTOS_CANVAS_W / 4);
-                    artos_line(x, y1, x + 1, y2, kw.accent_color, 1);
-                }
-            }
-            break;
-
-        default:
-            /* No pattern overlay for solid/gradient */
-            break;
+    /* === PASS 3: Midground (water, trees, flowers, boats) === */
+    if (ai_scene_has(sc, AI_ELEM_WATER) && sc->theme != AI_THEME_UNDERWATER) {
+        uint32_t water_dark = ai_darken(sc->pal.sky_bottom, 40);
+        ai_draw_gradient_band(hy, ARTOS_CANVAS_H, sc->pal.sky_bottom, water_dark);
+        for (int w = 0; w < 6; w++) {
+            int wy = hy + 10 + w * 15 + (int)(ai_rand() % 8);
+            uint32_t wcol = ai_lighten(sc->pal.sky_bottom, 60);
+            ai_draw_wave_band(wy, 3, 80 + (int)(ai_rand() % 40), wcol, 1);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_TREES) && sc->theme != AI_THEME_UNDERWATER) {
+        int count = sc->density / 3 + 2;
+        if (sc->style == AI_STYLE_MINIMAL) count = 3;
+        if (sc->style == AI_STYLE_CHAOTIC) count = 15;
+        for (int i = 0; i < count; i++) {
+            int tx = ai_centered_x(sc->composition);
+            int th = 30 + (int)(ai_rand() % 40);
+            ai_draw_tree(tx, hy, th, 0xFF4B3621, sc->pal.accent1);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_FLOWERS) && sc->theme != AI_THEME_UNDERWATER) {
+        int count = sc->density / 2 + 3;
+        for (int i = 0; i < count; i++) {
+            int fx = ai_centered_x(sc->composition);
+            int remain = ARTOS_CANVAS_H - hy - 20;
+            int fy = hy + 10 + (remain > 0 ? (int)(ai_rand() % remain) : 0);
+            int fr = 3 + (int)(ai_rand() % 5);
+            uint32_t pcol = (ai_rand() % 2) ? sc->pal.accent1 : sc->pal.accent2;
+            ai_draw_flower(fx, fy, fr, pcol, 0xFFFFFF00);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_BOATS) && ai_scene_has(sc, AI_ELEM_WATER)) {
+        int count = 1 + (int)(ai_rand() % 3);
+        for (int i = 0; i < count; i++) {
+            int bx = 50 + (int)(ai_rand() % (ARTOS_CANVAS_W - 100));
+            int by2 = hy + 5 + (int)(ai_rand() % 30);
+            int bs = 10 + (int)(ai_rand() % 10);
+            ai_draw_boat(bx, by2, bs, 0xFF663300);
+        }
     }
 
+    /* === PASS 4: Sky/overlay elements === */
+    if (ai_scene_has(sc, AI_ELEM_SUN)) {
+        int sx = 60 + (int)(ai_rand() % 100);
+        int sy = 25 + (int)(ai_rand() % 50);
+        int sr = 15 + (int)(ai_rand() % 10);
+        ai_draw_sun(sx, sy, sr, 0xFFFFDD00, 0xFFFFAA00);
+    }
+    if (ai_scene_has(sc, AI_ELEM_MOON)) {
+        int mx = 280 + (int)(ai_rand() % 80);
+        int my = 25 + (int)(ai_rand() % 40);
+        ai_draw_crescent(mx, my, 12 + (int)(ai_rand() % 8), 0xFFEEEECC);
+    }
+    if (ai_scene_has(sc, AI_ELEM_STARS)) {
+        int count = 20 + (int)(ai_rand() % 40);
+        if (sc->style == AI_STYLE_MINIMAL) count = 8;
+        if (sc->style == AI_STYLE_CHAOTIC) count = 80;
+        int max_y = sc->has_ground ? hy : ARTOS_CANVAS_H;
+        if (max_y < 1) max_y = ARTOS_CANVAS_H;
+        for (int i = 0; i < count; i++) {
+            int sx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int sy = (int)(ai_rand() % max_y);
+            uint32_t scol = (ai_rand() % 4 == 0) ? sc->pal.accent2 : 0xFFFFFFFF;
+            int kind = ai_rand() % 10;
+            if (kind < 5) {
+                /* Tiny dot (1px) */
+                artos_canvas_set(sx, sy, scol);
+            } else if (kind < 8) {
+                /* Small cross (3px) */
+                artos_canvas_set(sx, sy, scol);
+                artos_canvas_set(sx - 1, sy, scol);
+                artos_canvas_set(sx + 1, sy, scol);
+                artos_canvas_set(sx, sy - 1, scol);
+                artos_canvas_set(sx, sy + 1, scol);
+            } else {
+                /* Bright star with glow */
+                ai_draw_filled_circle_opacity(sx, sy, 3, scol, 40);
+                artos_canvas_set(sx, sy, scol);
+                artos_canvas_set(sx - 1, sy, scol);
+                artos_canvas_set(sx + 1, sy, scol);
+                artos_canvas_set(sx, sy - 1, scol);
+                artos_canvas_set(sx, sy + 1, scol);
+            }
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_CLOUDS)) {
+        int count = 2 + (int)(ai_rand() % 4);
+        for (int i = 0; i < count; i++) {
+            int cx = 30 + (int)(ai_rand() % (ARTOS_CANVAS_W - 60));
+            int cy = 20 + (int)(ai_rand() % 60);
+            int cs = 10 + (int)(ai_rand() % 12);
+            ai_draw_cloud(cx, cy, cs, 0xFFFFFFFF);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_HEARTS)) {
+        int count = 3 + (int)(ai_rand() % 6);
+        for (int i = 0; i < count; i++) {
+            int hx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int hy2 = (int)(ai_rand() % ARTOS_CANVAS_H);
+            int hs = 5 + (int)(ai_rand() % 12);
+            ai_draw_heart(hx, hy2, hs, sc->pal.accent1);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_DIAMONDS)) {
+        int count = 3 + (int)(ai_rand() % 6);
+        for (int i = 0; i < count; i++) {
+            int dx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int dy = (int)(ai_rand() % ARTOS_CANVAS_H);
+            int ds = 5 + (int)(ai_rand() % 10);
+            ai_draw_diamond(dx, dy, ds, sc->pal.accent2);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_AURORA)) {
+        for (int band = 0; band < 5; band++) {
+            int aby = 30 + band * 20 + (int)(ai_rand() % 15);
+            int hue_base = 120 + band * 30;
+            for (int ax = 0; ax < ARTOS_CANVAS_W; ax++) {
+                int wave = (isin((ax * 3) + band * 47) * 15) / 1024;
+                int ay = aby + wave;
+                int hue = hue_base + (ax * 20) / ARTOS_CANVAS_W;
+                uint32_t ac = hsv_to_rgb(hue, 200, 200);
+                for (int t = 0; t < 8; t++) {
+                    int alpha = 120 - t * 15;
+                    if (alpha > 0)
+                        artos_canvas_set_opacity(ax, ay + t, ac, alpha);
+                }
+            }
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_FIRE_FX)) {
+        for (int i = 0; i < 60; i++) {
+            int fx = ARTOS_CANVAS_W / 2 - 50 + (int)(ai_rand() % 100);
+            int fy = ARTOS_CANVAS_H - (int)(ai_rand() % 120);
+            int fs = 2 + (int)(ai_rand() % 4);
+            int hue = ((ARTOS_CANVAS_H - fy) * 60) / 120;
+            if (hue > 60) hue = 60;
+            uint32_t fc = hsv_to_rgb(hue, 255, 255);
+            ai_draw_filled_circle_opacity(fx, fy, fs, fc, 180);
+        }
+    }
+    /* v3 new elements */
+    if (ai_scene_has(sc, AI_ELEM_LIGHTNING)) {
+        int count = 1 + (int)(ai_rand() % 3);
+        for (int i = 0; i < count; i++) {
+            int lx = 50 + (int)(ai_rand() % (ARTOS_CANVAS_W - 100));
+            int ly0 = 10 + (int)(ai_rand() % 30);
+            int ly1 = hy > 0 ? hy - 20 : ARTOS_CANVAS_H - 40;
+            if (ly1 < ly0 + 20) ly1 = ly0 + 60;
+            ai_draw_lightning(lx, ly0, ly1, 0xFFFFFF88);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_RAINBOW)) {
+        int rcx = ARTOS_CANVAS_W / 2;
+        int rcy = sc->has_ground ? hy : ARTOS_CANVAS_H;
+        ai_draw_rainbow(rcx, rcy, 120 + (int)(ai_rand() % 40));
+    }
+    if (ai_scene_has(sc, AI_ELEM_PLANETS)) {
+        int count = 1 + (int)(ai_rand() % 2);
+        for (int i = 0; i < count; i++) {
+            int px = 50 + (int)(ai_rand() % (ARTOS_CANVAS_W - 100));
+            int py = 30 + (int)(ai_rand() % 80);
+            int pr = 10 + (int)(ai_rand() % 15);
+            uint32_t pc = (ai_rand() % 2) ? sc->pal.accent1 : sc->pal.accent2;
+            ai_draw_planet(px, py, pr, pc);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_BIRDS)) {
+        int count = 3 + (int)(ai_rand() % 8);
+        int flock_cx = 100 + (int)(ai_rand() % (ARTOS_CANVAS_W - 200));
+        int flock_cy = 30 + (int)(ai_rand() % 60);
+        for (int i = 0; i < count; i++) {
+            int bx = flock_cx + (int)(ai_rand() % 80) - 40;
+            int by2 = flock_cy + (int)(ai_rand() % 40) - 20;
+            int bs = 4 + (int)(ai_rand() % 4);
+            ai_draw_bird(bx, by2, bs, 0xFF333333);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_BUTTERFLIES)) {
+        int count = 3 + (int)(ai_rand() % 5);
+        for (int i = 0; i < count; i++) {
+            int bfx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int bfy = hy / 2 + (int)(ai_rand() % (ARTOS_CANVAS_H - hy / 2));
+            int bfs = 3 + (int)(ai_rand() % 3);
+            uint32_t bc = (ai_rand() % 2) ? sc->pal.accent1 : sc->pal.accent2;
+            ai_draw_butterfly(bfx, bfy, bfs, bc);
+        }
+    }
+
+    /* === PASS 4.5: Water reflections (after sky elements so they get reflected) === */
+    if (ai_scene_has(sc, AI_ELEM_WATER) && sc->theme != AI_THEME_UNDERWATER && hy > 0 && hy < ARTOS_CANVAS_H) {
+        ai_draw_water_reflection(hy, ai_darken(sc->pal.sky_bottom, 40));
+        /* Re-draw wave highlights on top of reflection */
+        for (int w = 0; w < 4; w++) {
+            int wy = hy + 10 + w * 20 + (int)(ai_rand() % 8);
+            uint32_t wcol = ai_lighten(sc->pal.sky_bottom, 40);
+            ai_draw_wave_band(wy, 2, 80 + (int)(ai_rand() % 40), wcol, 1);
+        }
+    }
+
+    /* === PASS 5: Atmospheric effects + pattern overlay + style post-processing === */
+    if (ai_scene_has(sc, AI_ELEM_RAIN)) {
+        int count = 40 + (int)(ai_rand() % 40);
+        for (int i = 0; i < count; i++) {
+            int rx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int ry = (int)(ai_rand() % ARTOS_CANVAS_H);
+            int rlen = 6 + (int)(ai_rand() % 8);
+            artos_line(rx, ry, rx - 2, ry + rlen, 0xFFB0C4DE, 1);
+        }
+    }
+    if (ai_scene_has(sc, AI_ELEM_SNOW)) {
+        int count = 30 + (int)(ai_rand() % 40);
+        for (int i = 0; i < count; i++) {
+            int sx = (int)(ai_rand() % ARTOS_CANVAS_W);
+            int sy = (int)(ai_rand() % ARTOS_CANVAS_H);
+            int ss = 1 + (int)(ai_rand() % 2);
+            ai_draw_filled_circle_opacity(sx, sy, ss, 0xFFFFFFFF, 180);
+        }
+    }
+
+    /* Pattern overlay */
+    if (sc->pattern != AI_PAT_NONE)
+        ai_render_pattern(sc);
+
+    /* Style post-processing */
+    if (sc->style == AI_STYLE_PIXEL) {
+        for (int pby = 0; pby < ARTOS_CANVAS_H; pby += 8)
+            for (int pbx = 0; pbx < ARTOS_CANVAS_W; pbx += 8) {
+                uint32_t c = artos_canvas_get(pbx + 4, pby + 4);
+                artos_fill_rect(pbx, pby, pbx + 7, pby + 7, c);
+            }
+    } else if (sc->style == AI_STYLE_ABSTRACT) {
+        /* Chromatic aberration: shift R channel right, B channel left */
+        for (int ay = 0; ay < ARTOS_CANVAS_H; ay++) {
+            for (int ax = 0; ax < ARTOS_CANVAS_W; ax++) {
+                uint32_t c = artos_canvas_get(ax, ay);
+                int shift = 3 + (ai_integer_noise(ax, ay) & 0x03);
+                uint32_t cr = artos_canvas_get(ax + shift, ay);
+                uint32_t cb = artos_canvas_get(ax - shift < 0 ? 0 : ax - shift, ay);
+                int r = (cr >> 16) & 0xFF;
+                int g = (c >> 8) & 0xFF;
+                int b = cb & 0xFF;
+                artos_canvas_set(ax, ay, 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+            }
+        }
+        /* Glitch block displacement */
+        for (int i = 0; i < 8; i++) {
+            int gbx = (int)(ai_rand() % (ARTOS_CANVAS_W - 40));
+            int gby = (int)(ai_rand() % (ARTOS_CANVAS_H - 20));
+            int gbw = 20 + (int)(ai_rand() % 40);
+            int gbh = 5 + (int)(ai_rand() % 15);
+            int shift_x = (int)(ai_rand() % 20) - 10;
+            for (int row = gby; row < gby + gbh && row < ARTOS_CANVAS_H; row++)
+                for (int col = gbx; col < gbx + gbw && col < ARTOS_CANVAS_W; col++) {
+                    int dst = col + shift_x;
+                    if (dst >= 0 && dst < ARTOS_CANVAS_W)
+                        artos_canvas_set(dst, row, artos_canvas_get(col, row));
+                }
+        }
+    } else if (sc->style == AI_STYLE_GEOMETRIC) {
+        /* Posterize to 4 levels per channel */
+        for (int gy = 0; gy < ARTOS_CANVAS_H; gy++) {
+            for (int gx = 0; gx < ARTOS_CANVAS_W; gx++) {
+                uint32_t c = artos_canvas_get(gx, gy);
+                int r = (((c >> 16) & 0xFF) / 64) * 85;
+                int g = (((c >> 8) & 0xFF) / 64) * 85;
+                int b = ((c & 0xFF) / 64) * 85;
+                artos_canvas_set(gx, gy, 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+            }
+        }
+        /* Thin geometric grid overlay */
+        for (int gy = 0; gy < ARTOS_CANVAS_H; gy += 15)
+            for (int gx = 0; gx < ARTOS_CANVAS_W; gx++)
+                artos_canvas_set_opacity(gx, gy, 0xFF000000, 60);
+        for (int gx = 0; gx < ARTOS_CANVAS_W; gx += 15)
+            for (int gy = 0; gy < ARTOS_CANVAS_H; gy++)
+                artos_canvas_set_opacity(gx, gy, 0xFF000000, 60);
+    } else if (sc->style == AI_STYLE_ORGANIC) {
+        /* Soft blur: 5-neighbor average */
+        for (int oy = 1; oy < ARTOS_CANVAS_H - 1; oy++) {
+            for (int ox = 1; ox < ARTOS_CANVAS_W - 1; ox++) {
+                uint32_t c = artos_canvas_get(ox, oy);
+                uint32_t n = artos_canvas_get(ox, oy - 1);
+                uint32_t s2 = artos_canvas_get(ox, oy + 1);
+                uint32_t w2 = artos_canvas_get(ox - 1, oy);
+                uint32_t e2 = artos_canvas_get(ox + 1, oy);
+                int r = (int)(((c>>16)&0xFF) + ((n>>16)&0xFF) + ((s2>>16)&0xFF) + ((w2>>16)&0xFF) + ((e2>>16)&0xFF)) / 5;
+                int g = (int)(((c>>8)&0xFF) + ((n>>8)&0xFF) + ((s2>>8)&0xFF) + ((w2>>8)&0xFF) + ((e2>>8)&0xFF)) / 5;
+                int b = (int)((c&0xFF) + (n&0xFF) + (s2&0xFF) + (w2&0xFF) + (e2&0xFF)) / 5;
+                artos_canvas_set(ox, oy, 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+            }
+        }
+        /* Spiral swirl overlays */
+        for (int i = 0; i < 3; i++) {
+            int scx = ARTOS_CANVAS_W / 2 + (int)(ai_rand() % 60) - 30;
+            int scy = ARTOS_CANVAS_H / 2 + (int)(ai_rand() % 60) - 30;
+            int sr = 30 + (int)(ai_rand() % 30);
+            ai_draw_spiral(scx, scy, sr, 2, ai_lighten(sc->pal.accent1, 40));
+        }
+    }
+}
+
+/* Local-only AI art generation (fallback when Groq unavailable) */
+static void generate_ai_art_local(void)
+{
+    if (art.ai_prompt[0] == '\0') return;
+    artos_undo_push();
+    art.ai_rand_seed = 12345;
+    for (int i = 0; art.ai_prompt[i]; i++)
+        art.ai_rand_seed = art.ai_rand_seed * 31 + (uint32_t)art.ai_prompt[i];
+    struct ai_scene sc = parse_ai_scene(art.ai_prompt);
+    generate_ai_art_from_scene(&sc);
     art.modified = 1;
+}
+
+/* Main entry: try Groq first, fallback to local */
+static void generate_ai_art(void)
+{
+    if (art.ai_prompt[0] == '\0') return;
+
+    /* Try Groq if COM2 serial available */
+    if (groq_serial_ready && !art.groq_pending) {
+        groq_send_prompt(art.ai_prompt);
+        art.groq_pending = 1;
+        art.groq_send_ms = timer_get_ms();
+        art.groq_resp_len = 0;
+        art.groq_response[0] = '\0';
+        strcpy(art.groq_status, "AI thinking...");
+        kprintf("[ArtOS] Groq request sent: %s\n", art.ai_prompt);
+        return;
+    }
+
+    /* Fallback: local generation */
+    generate_ai_art_local();
 }
 
 /*============================================================================
@@ -6592,8 +8330,8 @@ static void artos_init_state(void)
     art.brush_opacity = 255;
     art.zoom = 1;
     art.drawing = 0;
-    art.toolbar_h = ARTOS_TOOLBAR_H;
-    art.palette_h = ARTOS_PALETTE_H;
+    art.toolbar_h = ARTOS_TOPBAR_H;
+    art.palette_h = ARTOS_BOTTOMBAR_H;
     art.modified = 0;
     art.hsv_h = 0; art.hsv_s = 0; art.hsv_v = 0;
     art.star_sides = 5;
@@ -6602,6 +8340,11 @@ static void artos_init_state(void)
     art.grid_snap = 0;
     art.bezier_count = 0;
     art.clone_src_set = 0;
+    art.groq_pending = 0;
+    art.groq_resp_len = 0;
+    art.groq_send_ms = 0;
+    art.groq_response[0] = '\0';
+    art.groq_status[0] = '\0';
 
     /* Init layer 0 */
     art.layer_count = 1;
@@ -6960,6 +8703,112 @@ static void artos_smudge_apply(int cx, int cy, int size)
     }
 }
 
+/* Filled ellipse via scanlines */
+static void artos_filled_ellipse(int cx, int cy, int rx, int ry, uint32_t color)
+{
+    if (rx < 1) rx = 1;
+    if (ry < 1) ry = 1;
+    for (int dy = -ry; dy <= ry; dy++) {
+        /* half-width at this row: x^2/rx^2 + y^2/ry^2 = 1 => x = rx*sqrt(1 - y^2/ry^2) */
+        int half = (rx * isqrt(ry * ry - dy * dy)) / ry;
+        for (int dx = -half; dx <= half; dx++)
+            artos_canvas_set(cx + dx, cy + dy, color);
+    }
+}
+
+/* Filled star via scanline bucket */
+static void artos_filled_star(int cx, int cy, int radius, int sides, uint32_t color)
+{
+    if (sides < 3) sides = 3;
+    if (sides > 8) sides = 8;
+    int inner = radius * 2 / 5;
+    int pts = sides * 2;
+    /* Compute vertices */
+    int vx[16], vy[16];
+    for (int i = 0; i < pts; i++) {
+        int angle = (i * 360) / pts - 90; /* start from top */
+        int r = (i % 2 == 0) ? radius : inner;
+        vx[i] = cx + (icos(angle) * r) / 1024;
+        vy[i] = cy + (isin(angle) * r) / 1024;
+    }
+    /* Find bounding box */
+    int miny = vy[0], maxy = vy[0];
+    for (int i = 1; i < pts; i++) {
+        if (vy[i] < miny) miny = vy[i];
+        if (vy[i] > maxy) maxy = vy[i];
+    }
+    /* Scanline fill */
+    for (int y = miny; y <= maxy; y++) {
+        int xints[16], nints = 0;
+        for (int i = 0; i < pts; i++) {
+            int j = (i + 1) % pts;
+            int y0 = vy[i], y1 = vy[j];
+            if ((y0 <= y && y1 > y) || (y1 <= y && y0 > y)) {
+                int x = vx[i] + ((y - y0) * (vx[j] - vx[i])) / (y1 - y0);
+                if (nints < 16) xints[nints++] = x;
+            }
+        }
+        /* Sort intersections */
+        for (int a = 0; a < nints - 1; a++)
+            for (int b = a + 1; b < nints; b++)
+                if (xints[a] > xints[b]) { int t = xints[a]; xints[a] = xints[b]; xints[b] = t; }
+        /* Fill pairs */
+        for (int k = 0; k + 1 < nints; k += 2)
+            for (int x = xints[k]; x <= xints[k + 1]; x++)
+                artos_canvas_set(x, y, color);
+    }
+}
+
+/* Spiral drawing tool (Archimedean spiral between two points) */
+static void artos_draw_spiral(int cx, int cy, int end_x, int end_y, uint32_t color, int size)
+{
+    int dx = end_x - cx;
+    int dy = end_y - cy;
+    int max_r = isqrt(dx * dx + dy * dy);
+    if (max_r < 3) return;
+    int turns = 3;
+    int steps = turns * 72;
+    int px = cx, py = cy;
+    for (int i = 1; i <= steps; i++) {
+        int angle = i * 5;
+        int r = (max_r * i) / steps;
+        int nx = cx + (icos(angle) * r) / 1024;
+        int ny = cy + (isin(angle) * r) / 1024;
+        artos_line(px, py, nx, ny, color, size);
+        px = nx; py = ny;
+    }
+}
+
+/* Blur brush: average a circular area of pixels */
+static void artos_blur_plot(int cx, int cy, int size)
+{
+    int r = size; if (r < 2) r = 2;
+    /* For each pixel in the circle, average it with its 3x3 neighbors */
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy > r * r) continue;
+            int px = cx + dx, py = cy + dy;
+            /* Average 3x3 neighborhood */
+            int tr = 0, tg = 0, tb = 0, cnt = 0;
+            for (int ny = -1; ny <= 1; ny++) {
+                for (int nx = -1; nx <= 1; nx++) {
+                    uint32_t nc = artos_canvas_get(px + nx, py + ny);
+                    if (nc == 0) continue;
+                    tr += (int)((nc >> 16) & 0xFF);
+                    tg += (int)((nc >> 8) & 0xFF);
+                    tb += (int)(nc & 0xFF);
+                    cnt++;
+                }
+            }
+            if (cnt > 0) {
+                uint32_t avg = 0xFF000000 | ((uint32_t)(tr / cnt) << 16) |
+                               ((uint32_t)(tg / cnt) << 8) | (uint32_t)(tb / cnt);
+                artos_canvas_set(px, py, avg);
+            }
+        }
+    }
+}
+
 /* --- Edit operations --- */
 
 static void artos_flip_h(void)
@@ -7038,7 +8887,7 @@ static void artos_posterize(void)
         }
 }
 
-/* Paint callback — ArtOS v3 */
+/* Paint callback — ArtOS v4 sidebar layout */
 static void artos_paint(struct wm_window *win)
 {
     int cw = wm_content_width(win);
@@ -7050,191 +8899,141 @@ static void artos_paint(struct wm_window *win)
     /* Composite layers for display */
     artos_composite_layers();
 
-    /* === TOOLBAR (7 rows, 132px) === */
-    fb_fill_rect((uint32_t)ox, (uint32_t)oy, (uint32_t)cw, (uint32_t)ARTOS_TOOLBAR_H, tb_bg);
-
-    /* Row A (y=2): tools 0-5 */
-    for (int i = 0; i < 6; i++) {
-        uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
-        int bx = 4 + i * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 2), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
-        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 5), artos_tool_names[i], COLOR_WHITE, bg);
-    }
-    /* Row B (y=22): tools 6-11 */
-    for (int i = 6; i < 12; i++) {
-        uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
-        int bx = 4 + (i - 6) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 22), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
-        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 25), artos_tool_names[i], COLOR_WHITE, bg);
-    }
-    /* Row C (y=42): tools 12-17 */
-    for (int i = 12; i < 18; i++) {
-        uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
-        int bx = 4 + (i - 12) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 42), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
-        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 45), artos_tool_names[i], COLOR_WHITE, bg);
-    }
-    /* Row D (y=62): tools 18-23 */
-    for (int i = 18; i < ARTOS_TOOL_COUNT; i++) {
-        uint32_t bg = (i == art.tool) ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
-        int bx = 4 + (i - 18) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-        fb_fill_rect((uint32_t)(ox + bx), (uint32_t)(oy + 62), (uint32_t)ARTOS_BTN_W, (uint32_t)ARTOS_BTN_H, bg);
-        font_draw_string((uint32_t)(ox + bx + 2), (uint32_t)(oy + 65), artos_tool_names[i], COLOR_WHITE, bg);
-    }
-
-    /* Row E (y=82): Undo Clear | Size | Opac | FG BG Swap | Zoom | Mir Grd */
-    int ry = 82;
-    fb_fill_rect((uint32_t)(ox + 4), (uint32_t)(oy + ry), 36, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 6), (uint32_t)(oy + ry + 3), "Undo", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-    fb_fill_rect((uint32_t)(ox + 44), (uint32_t)(oy + ry), 36, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 46), (uint32_t)(oy + ry + 3), "Clr", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
+    /* === TOP CONTROL BAR (26px) === */
+    gfx_fill_gradient_v(ox, oy, cw, ARTOS_TOPBAR_H, 0xFF141B2A, 0xFF0D1117);
+    /* Subtle top highlight */
+    { uint32_t *bb = fb_get_backbuffer();
+      uint32_t fbw = fb_get_width();
+      if (bb) for (int hx = 0; hx < cw; hx++)
+          bb[(uint32_t)(oy) * fbw + (uint32_t)(ox + hx)] =
+              gfx_alpha_blend(COLOR_WHITE, bb[(uint32_t)(oy) * fbw + (uint32_t)(ox + hx)], 10);
+      fb_mark_dirty(ox, oy, cw, 1); }
+    int ry = 4;
+    /* Undo / Clear */
+    gfx_fill_rounded_rect_aa(ox + 4, oy + ry, 36, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_string((uint32_t)(ox + 6), (uint32_t)(oy + ry + 3), "Undo", COLOR_WHITE, 0xFF1E293B);
+    gfx_fill_rounded_rect_aa(ox + 44, oy + ry, 36, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_string((uint32_t)(ox + 46), (uint32_t)(oy + ry + 3), "Clr", COLOR_WHITE, 0xFF1E293B);
     /* Size -[n]+ */
     font_draw_string((uint32_t)(ox + 86), (uint32_t)(oy + ry + 3), "Sz", COLOR_TEXT_DIM, tb_bg);
-    fb_fill_rect((uint32_t)(ox + 104), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 108), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    gfx_fill_rounded_rect_aa(ox + 104, oy + ry, 16, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_char((uint32_t)(ox + 108), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, 0xFF1E293B);
     { char sc[4]; sc[0] = '0' + (char)(art.brush_size % 10);
       if (art.brush_size >= 10) { sc[0] = '1'; sc[1] = '0'; sc[2] = '\0'; }
       else { sc[1] = '\0'; }
       font_draw_string((uint32_t)(ox + 122), (uint32_t)(oy + ry + 3), sc, COLOR_TEXT, tb_bg); }
-    fb_fill_rect((uint32_t)(ox + 136), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 140), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
+    gfx_fill_rounded_rect_aa(ox + 136, oy + ry, 16, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_char((uint32_t)(ox + 140), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, 0xFF1E293B);
     /* Opacity -[n]+ */
     font_draw_string((uint32_t)(ox + 158), (uint32_t)(oy + ry + 3), "Op", COLOR_TEXT_DIM, tb_bg);
-    fb_fill_rect((uint32_t)(ox + 176), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 180), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    gfx_fill_rounded_rect_aa(ox + 176, oy + ry, 16, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_char((uint32_t)(ox + 180), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, 0xFF1E293B);
     { char ob[4]; int ov = (art.brush_opacity * 100) / 255;
       ob[0] = '0' + (char)(ov / 10); ob[1] = '0' + (char)(ov % 10); ob[2] = '\0';
       font_draw_string((uint32_t)(ox + 194), (uint32_t)(oy + ry + 3), ob, COLOR_TEXT, tb_bg); }
-    fb_fill_rect((uint32_t)(ox + 212), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 216), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
-    /* FG/BG swatches */
-    fb_fill_rect((uint32_t)(ox + 236), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, art.fg_color);
-    fb_draw_rect((uint32_t)(ox + 236), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, COLOR_TEXT_DIM);
-    fb_fill_rect((uint32_t)(ox + 258), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, art.bg_color);
-    fb_draw_rect((uint32_t)(ox + 258), (uint32_t)(oy + ry), 18, ARTOS_BTN_H, COLOR_TEXT_DIM);
-    fb_fill_rect((uint32_t)(ox + 280), (uint32_t)(oy + ry), 28, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 282), (uint32_t)(oy + ry + 3), "Swp", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
+    gfx_fill_rounded_rect_aa(ox + 212, oy + ry, 16, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_char((uint32_t)(ox + 216), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, 0xFF1E293B);
+    /* FG/BG swatches + Swap */
+    gfx_fill_rounded_rect_aa(ox + 236, oy + ry, 18, ARTOS_BTN_H, 3, art.fg_color);
+    gfx_draw_rounded_rect(ox + 236, oy + ry, 18, ARTOS_BTN_H, 3, COLOR_WHITE);
+    gfx_fill_rounded_rect_aa(ox + 258, oy + ry, 18, ARTOS_BTN_H, 3, art.bg_color);
+    gfx_draw_rounded_rect(ox + 258, oy + ry, 18, ARTOS_BTN_H, 3, COLOR_TEXT_DIM);
+    gfx_fill_rounded_rect_aa(ox + 280, oy + ry, 28, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_string((uint32_t)(ox + 282), (uint32_t)(oy + ry + 3), "Swp", COLOR_WHITE, 0xFF1E293B);
     /* Zoom -[n]+ */
     font_draw_string((uint32_t)(ox + 316), (uint32_t)(oy + ry + 3), "Zm", COLOR_TEXT_DIM, tb_bg);
-    fb_fill_rect((uint32_t)(ox + 334), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 338), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+    gfx_fill_rounded_rect_aa(ox + 334, oy + ry, 16, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_char((uint32_t)(ox + 338), (uint32_t)(oy + ry + 3), '-', COLOR_WHITE, 0xFF1E293B);
     { char zc = '0' + (char)art.zoom;
       font_draw_char((uint32_t)(ox + 354), (uint32_t)(oy + ry + 3), zc, COLOR_TEXT, tb_bg); }
-    fb_fill_rect((uint32_t)(ox + 364), (uint32_t)(oy + ry), 16, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_char((uint32_t)(ox + 368), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
-    /* Mirror mode toggle */
-    { uint32_t mir_bg = art.mirror_mode ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
-      fb_fill_rect((uint32_t)(ox + 388), (uint32_t)(oy + ry), 28, ARTOS_BTN_H, mir_bg);
+    gfx_fill_rounded_rect_aa(ox + 364, oy + ry, 16, ARTOS_BTN_H, 3, 0xFF1E293B);
+    font_draw_char((uint32_t)(ox + 368), (uint32_t)(oy + ry + 3), '+', COLOR_WHITE, 0xFF1E293B);
+    /* Mirror / Grid toggles */
+    { uint32_t mir_bg = art.mirror_mode ? COLOR_HIGHLIGHT : 0xFF1E293B;
+      gfx_fill_rounded_rect_aa(ox + 388, oy + ry, 28, ARTOS_BTN_H, 3, mir_bg);
       font_draw_string((uint32_t)(ox + 390), (uint32_t)(oy + ry + 3), "Mir", COLOR_WHITE, mir_bg); }
-    /* Grid snap toggle */
-    { uint32_t grd_bg = art.grid_snap ? COLOR_HIGHLIGHT : COLOR_BUTTON_PRIMARY;
-      fb_fill_rect((uint32_t)(ox + 420), (uint32_t)(oy + ry), 28, ARTOS_BTN_H, grd_bg);
+    { uint32_t grd_bg = art.grid_snap ? COLOR_HIGHLIGHT : 0xFF1E293B;
+      gfx_fill_rounded_rect_aa(ox + 420, oy + ry, 28, ARTOS_BTN_H, 3, grd_bg);
       font_draw_string((uint32_t)(ox + 422), (uint32_t)(oy + ry + 3), "Grd", COLOR_WHITE, grd_bg); }
+    /* Top bar separator */
+    gfx_draw_hline(ox, oy + ARTOS_TOPBAR_H - 1, cw, COLOR_PANEL_BORDER);
 
-    /* Row F (y=102): AI prompt */
-    int ai_y = 102;
-    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + ai_y + 3), "AI:", COLOR_TEXT_DIM, tb_bg);
-    uint32_t pbg = art.ai_input_active ? 0xFF1F2937 : 0xFF0F1419;
-    fb_fill_rect((uint32_t)(ox + 26), (uint32_t)(oy + ai_y), 280, ARTOS_BTN_H, pbg);
-    fb_draw_rect((uint32_t)(ox + 26), (uint32_t)(oy + ai_y), 280, ARTOS_BTN_H, COLOR_TEXT_DIM);
-    if (art.ai_prompt[0])
-        font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + ai_y + 3), art.ai_prompt, COLOR_TEXT, pbg);
-    else
-        font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + ai_y + 3), "(prompt...)", COLOR_TEXT_DIM, pbg);
-    if (art.ai_input_active)
-        gfx_draw_vline(ox + 30 + art.ai_prompt_cursor * 8, oy + ai_y + 2, 14, COLOR_HIGHLIGHT);
-    fb_fill_rect((uint32_t)(ox + 312), (uint32_t)(oy + ai_y), 56, ARTOS_BTN_H, COLOR_BUTTON_PRIMARY);
-    font_draw_string((uint32_t)(ox + 314), (uint32_t)(oy + ai_y + 3), "Gen", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-
-    /* Row G (y=120): DrawNet */
-    int dn_y = 120;
-    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + dn_y + 3), "Net:", COLOR_TEXT_DIM, tb_bg);
-    uint32_t sbg = art.drawnet_input_active ? 0xFF1F2937 : 0xFF0F1419;
-    fb_fill_rect((uint32_t)(ox + 32), (uint32_t)(oy + dn_y), 80, ARTOS_BTN_H, sbg);
-    fb_draw_rect((uint32_t)(ox + 32), (uint32_t)(oy + dn_y), 80, ARTOS_BTN_H, COLOR_TEXT_DIM);
-    if (art.drawnet_input[0])
-        font_draw_string((uint32_t)(ox + 36), (uint32_t)(oy + dn_y + 3), art.drawnet_input, COLOR_TEXT, sbg);
-    if (art.drawnet_input_active)
-        gfx_draw_vline(ox + 36 + (int)strlen(art.drawnet_input) * 8, oy + dn_y + 2, 14, COLOR_HIGHLIGHT);
-    if (art.drawnet_enabled) {
-        fb_fill_rect((uint32_t)(ox + 118), (uint32_t)(oy + dn_y), 36, ARTOS_BTN_H, COLOR_HIGHLIGHT);
-        font_draw_string((uint32_t)(ox + 120), (uint32_t)(oy + dn_y + 3), "Stop", COLOR_WHITE, COLOR_HIGHLIGHT);
-    } else {
-        fb_fill_rect((uint32_t)(ox + 118), (uint32_t)(oy + dn_y), 36, ARTOS_BTN_H, COLOR_GREEN_ACTIVE);
-        font_draw_string((uint32_t)(ox + 120), (uint32_t)(oy + dn_y + 3), "Go", COLOR_WHITE, COLOR_GREEN_ACTIVE);
+    /* === LEFT TOOL SIDEBAR (88px wide, single column) === */
+    int sb_y = ARTOS_TOPBAR_H;
+    int sb_h = ch - ARTOS_TOPBAR_H - ARTOS_BOTTOMBAR_H;
+    gfx_fill_gradient_v(ox, oy + sb_y, ARTOS_SIDEBAR_W, sb_h, 0xFF0F1218, 0xFF0A0E14);
+    gfx_draw_vline(ox + ARTOS_SIDEBAR_W - 1, oy + sb_y, sb_h, COLOR_PANEL_BORDER);
+    /* Draw tool buttons in single column, grouped */
+    { int ti = 0, by = 4;
+      for (int g = 0; g < 5; g++) {
+          if (g > 0) { /* group divider */
+              gfx_draw_hline(ox + 2, oy + sb_y + by, ARTOS_SIDEBAR_W - 4, 0xFF1E293B);
+              by += 3;
+          }
+          int gsz = sidebar_group_sizes[g];
+          for (int j = 0; j < gsz; j++) {
+              int tool_id = sidebar_tool_order[ti];
+              uint32_t bg = (tool_id == art.tool) ? COLOR_HIGHLIGHT : 0xFF1E293B;
+              gfx_fill_rounded_rect_aa(ox + 2, oy + sb_y + by, ARTOS_TBTN_W, ARTOS_TBTN_H, 3, bg);
+              font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + sb_y + by),
+                               sidebar_tool_labels[ti], COLOR_WHITE, bg);
+              ti++;
+              by += ARTOS_TBTN_H + ARTOS_TBTN_GAP;
+          }
+      }
     }
 
-    /* Separator */
-    gfx_draw_hline(ox, oy + ARTOS_TOOLBAR_H - 1, cw, COLOR_PANEL_BORDER);
+    /* === CANVAS AREA (center) === */
+    int ca_x = ARTOS_SIDEBAR_W;
+    int ca_y = ARTOS_TOPBAR_H;
+    int ca_w = cw - ARTOS_SIDEBAR_W - ARTOS_LAYER_PANEL_W;
+    int ca_h = ch - ARTOS_TOPBAR_H - ARTOS_BOTTOMBAR_H;
+    fb_fill_rect((uint32_t)(ox + ca_x), (uint32_t)(oy + ca_y), (uint32_t)ca_w, (uint32_t)ca_h, 0xFF202030);
 
-    /* === CANVAS AREA + LAYER PANEL === */
-    int ca_y = ARTOS_TOOLBAR_H;
-    int ca_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
-    int cp_w = cw - ARTOS_LAYER_PANEL_W; /* canvas panel width */
-
-    /* Canvas dark bg */
-    fb_fill_rect((uint32_t)ox, (uint32_t)(oy + ca_y), (uint32_t)cp_w, (uint32_t)ca_h, 0xFF202030);
-
-    /* Layer panel bg */
-    fb_fill_rect((uint32_t)(ox + cp_w), (uint32_t)(oy + ca_y),
-                 (uint32_t)ARTOS_LAYER_PANEL_W, (uint32_t)ca_h, 0xFF0F1218);
-    gfx_draw_vline(ox + cp_w, oy + ca_y, ca_h, COLOR_PANEL_BORDER);
-
-    /* Layer panel content */
-    font_draw_string((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + ca_y + 4), "Layers", COLOR_TEXT_DIM, 0xFF0F1218);
+    /* === RIGHT LAYER PANEL (72px) === */
+    int lp_x = cw - ARTOS_LAYER_PANEL_W;
+    gfx_fill_gradient_v(ox + lp_x, oy + ca_y, ARTOS_LAYER_PANEL_W, ca_h, 0xFF0F1218, 0xFF0A0E14);
+    gfx_draw_vline(ox + lp_x, oy + ca_y, ca_h, COLOR_PANEL_BORDER);
+    font_draw_string((uint32_t)(ox + lp_x + 4), (uint32_t)(oy + ca_y + 4), "Layers", COLOR_TEXT_DIM, 0xFF0F1218);
+    gfx_draw_hline(ox + lp_x + 2, oy + ca_y + 18, ARTOS_LAYER_PANEL_W - 4, COLOR_PANEL_BORDER);
     for (int l = 0; l < art.layer_count; l++) {
         int ly = ca_y + 22 + l * 24;
-        uint32_t lbg = (l == art.active_layer) ? 0xFF1E3A5F : 0xFF0F1218;
-        fb_fill_rect((uint32_t)(ox + cp_w + 2), (uint32_t)(oy + ly), (uint32_t)(ARTOS_LAYER_PANEL_W - 4), 22, lbg);
-        /* Eye icon (visibility) */
+        uint32_t lbg = (l == art.active_layer) ? 0xFF1E3A5F : 0xFF121820;
+        gfx_fill_rounded_rect_aa(ox + lp_x + 2, oy + ly, ARTOS_LAYER_PANEL_W - 4, 22, 3, lbg);
         uint32_t ec = art.layers[l].visible ? COLOR_GREEN_ACTIVE : COLOR_TEXT_DIM;
-        fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + ly + 6), 8, 8, ec);
-        /* Layer name */
-        font_draw_string((uint32_t)(ox + cp_w + 16), (uint32_t)(oy + ly + 5),
+        gfx_fill_rounded_rect_aa(ox + lp_x + 4, oy + ly + 6, 8, 8, 3, ec);
+        font_draw_string((uint32_t)(ox + lp_x + 16), (uint32_t)(oy + ly + 5),
                          art.layers[l].name, COLOR_TEXT, lbg);
     }
-
-    /* Add layer button */
     if (art.layer_count < ARTOS_MAX_LAYERS) {
         int aby = ca_y + 22 + art.layer_count * 24 + 4;
-        fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + aby), 52, 16, COLOR_BUTTON_PRIMARY);
-        font_draw_string((uint32_t)(ox + cp_w + 8), (uint32_t)(oy + aby + 2), "+Layer", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+        gfx_fill_rounded_rect_aa(ox + lp_x + 4, oy + aby, 64, 16, 3, 0xFF1E293B);
+        font_draw_string((uint32_t)(ox + lp_x + 8), (uint32_t)(oy + aby + 2), "+Layer", COLOR_WHITE, 0xFF1E293B);
     }
-
-    /* Flatten button */
     if (art.layer_count > 1) {
         int fby = ca_y + 22 + ARTOS_MAX_LAYERS * 24 + 8;
-        fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + fby), 52, 16, COLOR_BUTTON_PRIMARY);
-        font_draw_string((uint32_t)(ox + cp_w + 6), (uint32_t)(oy + fby + 2), "Flatten", COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+        gfx_fill_rounded_rect_aa(ox + lp_x + 4, oy + fby, 64, 16, 3, 0xFF1E293B);
+        font_draw_string((uint32_t)(ox + lp_x + 6), (uint32_t)(oy + fby + 2), "Flatten", COLOR_WHITE, 0xFF1E293B);
     }
-
-    /* Layer opacity */
     { int loy = ca_y + ca_h - 40;
-      font_draw_string((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + loy), "Opac", COLOR_TEXT_DIM, 0xFF0F1218);
-      fb_fill_rect((uint32_t)(ox + cp_w + 4), (uint32_t)(oy + loy + 14), 16, 14, COLOR_BUTTON_PRIMARY);
-      font_draw_char((uint32_t)(ox + cp_w + 8), (uint32_t)(oy + loy + 16), '-', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
-      fb_fill_rect((uint32_t)(ox + cp_w + 40), (uint32_t)(oy + loy + 14), 16, 14, COLOR_BUTTON_PRIMARY);
-      font_draw_char((uint32_t)(ox + cp_w + 44), (uint32_t)(oy + loy + 16), '+', COLOR_WHITE, COLOR_BUTTON_PRIMARY);
+      font_draw_string((uint32_t)(ox + lp_x + 4), (uint32_t)(oy + loy), "Opac", COLOR_TEXT_DIM, 0xFF0F1218);
+      gfx_fill_rounded_rect_aa(ox + lp_x + 4, oy + loy + 14, 16, 14, 3, 0xFF1E293B);
+      font_draw_char((uint32_t)(ox + lp_x + 8), (uint32_t)(oy + loy + 16), '-', COLOR_WHITE, 0xFF1E293B);
+      gfx_fill_rounded_rect_aa(ox + lp_x + 40, oy + loy + 14, 16, 14, 3, 0xFF1E293B);
+      font_draw_char((uint32_t)(ox + lp_x + 44), (uint32_t)(oy + loy + 16), '+', COLOR_WHITE, 0xFF1E293B);
       char lop[4]; int lov = (art.layers[art.active_layer].opacity * 100) / 255;
       lop[0] = '0' + (char)(lov / 10); lop[1] = '0' + (char)(lov % 10); lop[2] = '\0';
-      font_draw_string((uint32_t)(ox + cp_w + 22), (uint32_t)(oy + loy + 16), lop, COLOR_TEXT, 0xFF0F1218);
+      font_draw_string((uint32_t)(ox + lp_x + 22), (uint32_t)(oy + loy + 16), lop, COLOR_TEXT, 0xFF0F1218);
     }
 
-    /* Calculate zoom/pan for canvas rendering */
-    int avail_w = cp_w - ARTOS_MARGIN * 2;
+    /* === CANVAS RENDERING (zoom/pan) === */
+    int avail_w = ca_w - ARTOS_MARGIN * 2;
     int avail_h = ca_h - ARTOS_MARGIN * 2;
     art.pixel_scale = art.zoom;
-
     int vp_cw = avail_w / art.pixel_scale;
     int vp_ch = avail_h / art.pixel_scale;
     if (vp_cw > ARTOS_CANVAS_W) vp_cw = ARTOS_CANVAS_W;
     if (vp_ch > ARTOS_CANVAS_H) vp_ch = ARTOS_CANVAS_H;
-
     /* Clamp scroll */
     int msx = ARTOS_CANVAS_W - vp_cw; if (msx < 0) msx = 0;
     int msy = ARTOS_CANVAS_H - vp_ch; if (msy < 0) msy = 0;
@@ -7242,32 +9041,27 @@ static void artos_paint(struct wm_window *win)
     if (art.scroll_y > msy) art.scroll_y = msy;
     if (art.scroll_x < 0) art.scroll_x = 0;
     if (art.scroll_y < 0) art.scroll_y = 0;
-
     int disp_w = vp_cw * art.pixel_scale;
     int disp_h = vp_ch * art.pixel_scale;
     int off_x = (disp_w <= avail_w) ? (avail_w - disp_w) / 2 : 0;
     int off_y = (disp_h <= avail_h) ? (avail_h - disp_h) / 2 : 0;
-    art.canvas_ox = ARTOS_MARGIN + off_x;
+    art.canvas_ox = ca_x + ARTOS_MARGIN + off_x;
     art.canvas_oy = ca_y + ARTOS_MARGIN + off_y;
-
-    /* Draw composite canvas (zoomed + scrolled) */
+    /* Draw composite canvas */
     for (int vy = 0; vy < vp_ch; vy++) {
         for (int vx = 0; vx < vp_cw; vx++) {
-            int ccx = art.scroll_x + vx;
-            int ccy = art.scroll_y + vy;
-            uint32_t color = art.composite[ccy * ARTOS_CANVAS_W + ccx];
+            uint32_t color = art.composite[(art.scroll_y + vy) * ARTOS_CANVAS_W + art.scroll_x + vx];
             int sx = ox + art.canvas_ox + vx * art.pixel_scale;
             int sy = oy + art.canvas_oy + vy * art.pixel_scale;
             fb_fill_rect((uint32_t)sx, (uint32_t)sy,
                          (uint32_t)art.pixel_scale, (uint32_t)art.pixel_scale, color);
         }
     }
-
-    /* Canvas border */
-    fb_draw_rect((uint32_t)(ox + art.canvas_ox - 1), (uint32_t)(oy + art.canvas_oy - 1),
-                 (uint32_t)(disp_w + 2), (uint32_t)(disp_h + 2), COLOR_TEXT_DIM);
-
-    /* Selection overlay (dashed rect) */
+    /* Canvas shadow + border */
+    gfx_draw_soft_shadow(ox + art.canvas_ox - 2, oy + art.canvas_oy - 2, disp_w + 4, disp_h + 4, 3);
+    gfx_draw_rounded_rect(ox + art.canvas_ox - 1, oy + art.canvas_oy - 1,
+                          disp_w + 2, disp_h + 2, 2, COLOR_TEXT_DIM);
+    /* Selection overlay */
     if (art.sel_active) {
         int sx1 = (art.sel_x1 - art.scroll_x) * art.pixel_scale + art.canvas_ox;
         int sy1 = (art.sel_y1 - art.scroll_y) * art.pixel_scale + art.canvas_oy;
@@ -7276,8 +9070,7 @@ static void artos_paint(struct wm_window *win)
         fb_draw_rect((uint32_t)(ox + sx1), (uint32_t)(oy + sy1),
                      (uint32_t)(sx2 - sx1), (uint32_t)(sy2 - sy1), COLOR_HIGHLIGHT);
     }
-
-    /* Bezier control point markers */
+    /* Bezier control points */
     if (art.tool == ARTOS_TOOL_BEZIER && art.bezier_count > 0) {
         for (int bi = 0; bi < art.bezier_count; bi++) {
             int bpx = (art.bezier_pts[bi][0] - art.scroll_x) * art.pixel_scale + art.canvas_ox;
@@ -7286,101 +9079,140 @@ static void artos_paint(struct wm_window *win)
             fb_draw_rect((uint32_t)(ox + bpx - 3), (uint32_t)(oy + bpy - 3), 7, 7, COLOR_WHITE);
         }
     }
-
     /* Clone source crosshair */
     if (art.tool == ARTOS_TOOL_CLONE && art.clone_src_set) {
         int csx = (art.clone_src_x - art.scroll_x) * art.pixel_scale + art.canvas_ox;
         int csy = (art.clone_src_y - art.scroll_y) * art.pixel_scale + art.canvas_oy;
-        /* Horizontal line */
         for (int ci = -4; ci <= 4; ci++)
             if (ci != 0)
                 fb_fill_rect((uint32_t)(ox + csx + ci), (uint32_t)(oy + csy), 1, 1, 0x0000FF00);
-        /* Vertical line */
         for (int ci = -4; ci <= 4; ci++)
             if (ci != 0)
                 fb_fill_rect((uint32_t)(ox + csx), (uint32_t)(oy + csy + ci), 1, 1, 0x0000FF00);
     }
-
-    /* Grid overlay when snap enabled */
+    /* Grid overlay */
     if (art.grid_snap && art.zoom >= 2) {
         int gs = art.grid_size * art.pixel_scale;
         int gsx = art.canvas_ox - (art.scroll_x % art.grid_size) * art.pixel_scale;
-        int gsy = ARTOS_TOOLBAR_H - (art.scroll_y % art.grid_size) * art.pixel_scale;
-        int canvas_px_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
-        for (int gx = gsx; gx < art.canvas_ox + ARTOS_CANVAS_W * art.pixel_scale; gx += gs)
-            for (int gy = 0; gy < canvas_px_h; gy += 4)
-                fb_fill_rect((uint32_t)(ox + gx), (uint32_t)(oy + ARTOS_TOOLBAR_H + gy), 1, 1, 0x40808080);
-        for (int gy = gsy; gy < canvas_px_h; gy += gs)
-            for (int gx = 0; gx < art.canvas_ox + ARTOS_CANVAS_W * art.pixel_scale - art.canvas_ox; gx += 4)
-                fb_fill_rect((uint32_t)(ox + art.canvas_ox + gx), (uint32_t)(oy + ARTOS_TOOLBAR_H + gy), 1, 1, 0x40808080);
+        int gsy = art.canvas_oy - (art.scroll_y % art.grid_size) * art.pixel_scale;
+        for (int gx = gsx; gx < (int)(art.canvas_ox + ARTOS_CANVAS_W * art.pixel_scale); gx += gs)
+            for (int gy = 0; gy < ca_h; gy += 4)
+                fb_fill_rect((uint32_t)(ox + gx), (uint32_t)(oy + ca_y + gy), 1, 1, 0x40808080);
+        for (int gy = gsy; gy < (int)(art.canvas_oy + ARTOS_CANVAS_H * art.pixel_scale); gy += gs)
+            for (int gx = 0; gx < ca_w; gx += 4)
+                fb_fill_rect((uint32_t)(ox + ca_x + gx), (uint32_t)(oy + gy), 1, 1, 0x40808080);
     }
-
-    /* Mirror mode center line indicator */
+    /* Mirror mode center line */
     if (art.mirror_mode) {
         int mcx = (ARTOS_CANVAS_W / 2 - art.scroll_x) * art.pixel_scale + art.canvas_ox;
-        int canvas_px_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
-        for (int my = 0; my < canvas_px_h; my += 2)
-            fb_fill_rect((uint32_t)(ox + mcx), (uint32_t)(oy + ARTOS_TOOLBAR_H + my), 1, 1, 0x00FF00FF);
+        for (int my = 0; my < ca_h; my += 2)
+            fb_fill_rect((uint32_t)(ox + mcx), (uint32_t)(oy + ca_y + my), 1, 1, 0x00FF00FF);
     }
-
     /* Star sides indicator */
-    if (art.tool == ARTOS_TOOL_STAR) {
+    if (art.tool == ARTOS_TOOL_STAR || art.tool == ARTOS_TOOL_FILLSTAR) {
         char stxt[8]; stxt[0] = '0' + (char)art.star_sides; stxt[1] = 'p'; stxt[2] = 't'; stxt[3] = '\0';
-        font_draw_string((uint32_t)(ox + cw - 30), (uint32_t)(oy + ARTOS_TOOLBAR_H + 2), stxt, 0x00FFFF00, 0x00333333);
+        font_draw_string((uint32_t)(ox + lp_x - 30), (uint32_t)(oy + ca_y + 2), stxt, 0x00FFFF00, 0x00333333);
     }
 
-    /* === BOTTOM PALETTE (44px) === */
-    int pal_y = ch - ARTOS_PALETTE_H;
-    fb_fill_rect((uint32_t)ox, (uint32_t)(oy + pal_y), (uint32_t)cw, (uint32_t)ARTOS_PALETTE_H, tb_bg);
-    gfx_draw_hline(ox, oy + pal_y, cw, COLOR_PANEL_BORDER);
-
-    /* 16 quick swatches (left side, 14x14) */
+    /* === BOTTOM BAR (54px) === */
+    int bb_y = ch - ARTOS_BOTTOMBAR_H;
+    gfx_fill_gradient_v(ox, oy + bb_y, cw, ARTOS_BOTTOMBAR_H, 0xFF141B2A, 0xFF0D1117);
+    gfx_draw_hline(ox, oy + bb_y, cw, COLOR_PANEL_BORDER);
+    /* Row 1 (y+2): 16 swatches + HSV + preview */
     int ssz = 14, sgap = 2;
-    int srow_y = pal_y + 4;
     for (int i = 0; i < ARTOS_PALETTE_COUNT; i++) {
         int sx = 4 + i * (ssz + sgap);
-        fb_fill_rect((uint32_t)(ox + sx), (uint32_t)(oy + srow_y), (uint32_t)ssz, (uint32_t)ssz, artos_palette[i]);
+        gfx_fill_rounded_rect_aa(ox + sx, oy + bb_y + 2, ssz, ssz, 2, artos_palette[i]);
         uint32_t bd = (artos_palette[i] == art.fg_color) ? COLOR_HIGHLIGHT : COLOR_TEXT_DIM;
-        fb_draw_rect((uint32_t)(ox + sx), (uint32_t)(oy + srow_y), (uint32_t)ssz, (uint32_t)ssz, bd);
+        gfx_draw_rounded_rect(ox + sx, oy + bb_y + 2, ssz, ssz, 2, bd);
     }
-
-    /* HSV Hue bar (right side) */
-    int hue_x = 280;
+    /* HSV Hue bar */
+    int hue_x = 264;
     for (int hx = 0; hx < ARTOS_HUE_BAR_W; hx++) {
         uint32_t hc = hsv_to_rgb(hx * 360 / ARTOS_HUE_BAR_W, 255, 255);
-        fb_fill_rect((uint32_t)(ox + hue_x + hx), (uint32_t)(oy + pal_y + 4), 1, (uint32_t)ARTOS_HUE_BAR_H, hc);
+        fb_fill_rect((uint32_t)(ox + hue_x + hx), (uint32_t)(oy + bb_y + 3), 1, (uint32_t)ARTOS_HUE_BAR_H, hc);
     }
-    /* Hue marker */
     { int hm = hue_x + art.hsv_h * ARTOS_HUE_BAR_W / 360;
-      fb_draw_rect((uint32_t)(ox + hm - 1), (uint32_t)(oy + pal_y + 3), 3, (uint32_t)(ARTOS_HUE_BAR_H + 2), COLOR_WHITE); }
-
-    /* SV box */
-    int sv_x = 416;
+      fb_draw_rect((uint32_t)(ox + hm - 1), (uint32_t)(oy + bb_y + 2), 3, (uint32_t)(ARTOS_HUE_BAR_H + 2), COLOR_WHITE); }
+    /* SV box (spans both rows) */
+    int sv_x = 430;
     for (int sy2 = 0; sy2 < ARTOS_SV_BOX_SIZE; sy2++) {
         for (int sx2 = 0; sx2 < ARTOS_SV_BOX_SIZE; sx2++) {
             int s = sx2 * 255 / (ARTOS_SV_BOX_SIZE - 1);
             int v = (ARTOS_SV_BOX_SIZE - 1 - sy2) * 255 / (ARTOS_SV_BOX_SIZE - 1);
             uint32_t pc = hsv_to_rgb(art.hsv_h, s, v);
-            fb_fill_rect((uint32_t)(ox + sv_x + sx2), (uint32_t)(oy + pal_y + 4 + sy2), 1, 1, pc);
+            fb_fill_rect((uint32_t)(ox + sv_x + sx2), (uint32_t)(oy + bb_y + 2 + sy2), 1, 1, pc);
         }
     }
-    fb_draw_rect((uint32_t)(ox + sv_x), (uint32_t)(oy + pal_y + 4),
-                 (uint32_t)ARTOS_SV_BOX_SIZE, (uint32_t)ARTOS_SV_BOX_SIZE, COLOR_TEXT_DIM);
-
+    gfx_draw_rounded_rect(ox + sv_x, oy + bb_y + 2, ARTOS_SV_BOX_SIZE, ARTOS_SV_BOX_SIZE, 2, COLOR_TEXT_DIM);
     /* Color preview */
-    fb_fill_rect((uint32_t)(ox + 454), (uint32_t)(oy + pal_y + 4), 20, 20, art.fg_color);
-    fb_draw_rect((uint32_t)(ox + 454), (uint32_t)(oy + pal_y + 4), 20, 20, COLOR_TEXT_DIM);
-
-    /* Status line */
-    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + pal_y + 24), "ArtOS", COLOR_ICON_PURPLE, tb_bg);
+    gfx_fill_rounded_rect_aa(ox + 480, oy + bb_y + 2, 20, 20, 3, art.fg_color);
+    gfx_draw_rounded_rect(ox + 480, oy + bb_y + 2, 20, 20, 3, COLOR_WHITE);
+    /* Row 2 (y+28): AI prompt + DrawNet + Status */
+    int r2y = bb_y + 28;
+    font_draw_string((uint32_t)(ox + 4), (uint32_t)(oy + r2y + 3), "AI:", COLOR_TEXT_DIM, tb_bg);
+    { uint32_t pbg = art.ai_input_active ? 0xFF1F2937 : 0xFF0F1419;
+      gfx_fill_rounded_rect_aa(ox + 26, oy + r2y, 280, ARTOS_BTN_H, 4, pbg);
+      gfx_draw_rounded_rect(ox + 26, oy + r2y, 280, ARTOS_BTN_H, 4,
+                            art.ai_input_active ? COLOR_HIGHLIGHT : COLOR_TEXT_DIM);
+      if (art.ai_prompt[0])
+          font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + r2y + 3), art.ai_prompt, COLOR_TEXT, pbg);
+      else
+          font_draw_string((uint32_t)(ox + 30), (uint32_t)(oy + r2y + 3), "(prompt...)", COLOR_TEXT_DIM, pbg);
+      if (art.ai_input_active)
+          gfx_draw_vline(ox + 30 + art.ai_prompt_cursor * 8, oy + r2y + 2, 14, COLOR_HIGHLIGHT); }
+    if (art.groq_pending) {
+        gfx_fill_rounded_rect_aa(ox + 312, oy + r2y, 56, ARTOS_BTN_H, 3, 0xFFEAB308);
+        font_draw_string((uint32_t)(ox + 320), (uint32_t)(oy + r2y + 3), "...", COLOR_WHITE, 0xFFEAB308);
+    } else {
+        gfx_fill_rounded_rect_aa(ox + 312, oy + r2y, 56, ARTOS_BTN_H, 3, COLOR_HIGHLIGHT);
+        font_draw_string((uint32_t)(ox + 316), (uint32_t)(oy + r2y + 3), "Gen", COLOR_WHITE, COLOR_HIGHLIGHT);
+    }
+    /* DrawNet */
+    font_draw_string((uint32_t)(ox + 376), (uint32_t)(oy + r2y + 3), "Net:", COLOR_TEXT_DIM, tb_bg);
+    { uint32_t sbg = art.drawnet_input_active ? 0xFF1F2937 : 0xFF0F1419;
+      gfx_fill_rounded_rect_aa(ox + 410, oy + r2y, 64, ARTOS_BTN_H, 4, sbg);
+      gfx_draw_rounded_rect(ox + 410, oy + r2y, 64, ARTOS_BTN_H, 4,
+                            art.drawnet_input_active ? COLOR_HIGHLIGHT : COLOR_TEXT_DIM);
+      if (art.drawnet_input[0])
+          font_draw_string((uint32_t)(ox + 414), (uint32_t)(oy + r2y + 3), art.drawnet_input, COLOR_TEXT, sbg);
+      if (art.drawnet_input_active)
+          gfx_draw_vline(ox + 414 + (int)strlen(art.drawnet_input) * 8, oy + r2y + 2, 14, COLOR_HIGHLIGHT); }
+    if (art.drawnet_enabled) {
+        gfx_fill_rounded_rect_aa(ox + 480, oy + r2y, 36, ARTOS_BTN_H, 3, COLOR_HIGHLIGHT);
+        font_draw_string((uint32_t)(ox + 482), (uint32_t)(oy + r2y + 3), "Stop", COLOR_WHITE, COLOR_HIGHLIGHT);
+    } else {
+        gfx_fill_rounded_rect_aa(ox + 480, oy + r2y, 36, ARTOS_BTN_H, 3, COLOR_GREEN_ACTIVE);
+        font_draw_string((uint32_t)(ox + 482), (uint32_t)(oy + r2y + 3), "Go", COLOR_WHITE, COLOR_GREEN_ACTIVE);
+    }
+    /* Export button */
+    { uint32_t exp_bg = 0xFF16A34A;
+      if (art.export_status_time > 0) {
+          uint64_t el = timer_get_ticks() - art.export_status_time;
+          if (el < 300) exp_bg = 0xFFEAB308;
+          else art.export_status_time = 0;
+      }
+      gfx_fill_rounded_rect_aa(ox + 520, oy + r2y, 56, ARTOS_BTN_H, 3, exp_bg);
+      font_draw_string((uint32_t)(ox + 524), (uint32_t)(oy + r2y + 3), "Export", COLOR_WHITE, exp_bg); }
+    /* Status */
+    if (art.groq_pending) {
+        int dots = (int)((timer_get_ticks() / 25) % 4);
+        char ai_st[8]; strcpy(ai_st, "AI");
+        if (dots >= 1) strcat(ai_st, ".");
+        if (dots >= 2) strcat(ai_st, ".");
+        if (dots >= 3) strcat(ai_st, ".");
+        font_draw_string((uint32_t)(ox + 582), (uint32_t)(oy + r2y + 3), ai_st, 0xFFEAB308, tb_bg);
+    } else if (art.groq_status[0]) {
+        font_draw_string((uint32_t)(ox + 582), (uint32_t)(oy + r2y + 3), art.groq_status, 0xFF22C55E, tb_bg);
+    } else {
+        font_draw_string((uint32_t)(ox + 582), (uint32_t)(oy + r2y + 3), "ArtOS", COLOR_ICON_PURPLE, tb_bg);
+    }
     if (art.modified)
-        font_draw_string((uint32_t)(ox + 52), (uint32_t)(oy + pal_y + 24), "*", COLOR_HIGHLIGHT, tb_bg);
-
-    /* Canvas info */
-    { char info[32]; strcpy(info, "256x192 z:");
-      info[10] = '0' + (char)art.zoom; info[11] = 'x'; info[12] = ' '; info[13] = 'L';
-      info[14] = '1' + (char)art.active_layer; info[15] = '\0';
-      font_draw_string((uint32_t)(ox + cw - 128), (uint32_t)(oy + pal_y + 24), info, COLOR_TEXT_DIM, tb_bg); }
+        font_draw_string((uint32_t)(ox + 630), (uint32_t)(oy + r2y + 3), "*", COLOR_HIGHLIGHT, tb_bg);
+    { char info[32]; strcpy(info, "z:");
+      info[2] = '0' + (char)art.zoom; info[3] = 'x'; info[4] = ' '; info[5] = 'L';
+      info[6] = '1' + (char)art.active_layer; info[7] = '\0';
+      font_draw_string((uint32_t)(ox + 642), (uint32_t)(oy + r2y + 3), info, COLOR_TEXT_DIM, tb_bg); }
 
     /* DrawNet peer cursors */
     drawnet_paint_cursors(win);
@@ -7443,6 +9275,11 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
             } else if (art.tool == ARTOS_TOOL_SMUDGE) {
                 artos_smudge_apply(cx_coord, cy_coord, art.brush_size);
                 art.last_cx = cx_coord; art.last_cy = cy_coord;
+            } else if (art.tool == ARTOS_TOOL_BLUR) {
+                artos_blur_plot(cx_coord, cy_coord, art.brush_size);
+                if (art.mirror_mode)
+                    artos_blur_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, art.brush_size);
+                art.last_cx = cx_coord; art.last_cy = cy_coord;
             } else if (art.tool == ARTOS_TOOL_SELECT) {
                 if (art.sel_moving) {
                     int ddx = cx_coord - art.sel_move_ox;
@@ -7473,7 +9310,9 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
                        art.tool == ARTOS_TOOL_FILLRECT || art.tool == ARTOS_TOOL_ELLIPSE ||
                        art.tool == ARTOS_TOOL_RNDRECT || art.tool == ARTOS_TOOL_CIRCLE ||
                        art.tool == ARTOS_TOOL_STAR || art.tool == ARTOS_TOOL_ARROW ||
-                       art.tool == ARTOS_TOOL_GRADFILL) {
+                       art.tool == ARTOS_TOOL_GRADFILL ||
+                       art.tool == ARTOS_TOOL_FILLOVAL || art.tool == ARTOS_TOOL_FILLSTAR ||
+                       art.tool == ARTOS_TOOL_SPIRAL) {
                 /* Restore saved layer and draw shape preview */
                 memcpy(layer_px, art.shape_save,
                        sizeof(uint32_t) * ARTOS_CANVAS_W * ARTOS_CANVAS_H);
@@ -7512,6 +9351,22 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
                                 art.fg_color, art.brush_size);
                 } else if (art.tool == ARTOS_TOOL_GRADFILL) {
                     artos_grad_fill(art.start_cx, art.start_cy, cx_coord, cy_coord);
+                } else if (art.tool == ARTOS_TOOL_FILLOVAL) {
+                    int ecx = (art.start_cx + cx_coord) / 2;
+                    int ecy = (art.start_cy + cy_coord) / 2;
+                    int erx = (cx_coord - art.start_cx) / 2;
+                    int ery = (cy_coord - art.start_cy) / 2;
+                    if (erx < 0) erx = -erx;
+                    if (ery < 0) ery = -ery;
+                    artos_filled_ellipse(ecx, ecy, erx, ery, art.fg_color);
+                } else if (art.tool == ARTOS_TOOL_FILLSTAR) {
+                    int ddx = cx_coord - art.start_cx;
+                    int ddy = cy_coord - art.start_cy;
+                    int r = isqrt(ddx * ddx + ddy * ddy);
+                    artos_filled_star(art.start_cx, art.start_cy, r, art.star_sides, art.fg_color);
+                } else if (art.tool == ARTOS_TOOL_SPIRAL) {
+                    artos_draw_spiral(art.start_cx, art.start_cy, cx_coord, cy_coord,
+                                      art.fg_color, art.brush_size);
                 }
             }
         }
@@ -7547,65 +9402,8 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
 
     /* === Normal click (initial press) === */
 
-    /* Deactivate text input fields when clicking elsewhere */
-    int clicked_ai = 0, clicked_dn = 0;
-
-    /* Row A (y=2..19): tools 0-5 */
-    if (y >= 2 && y < 20) {
-        for (int i = 0; i < 6; i++) {
-            int bx = 4 + i * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-            if (x >= bx && x < bx + ARTOS_BTN_W) {
-                art.tool = i;
-                art.text_active = 0;
-                return;
-            }
-        }
-    }
-
-    /* Row B (y=22..39): tools 6-11 */
-    if (y >= 22 && y < 40) {
-        for (int i = 6; i < 12; i++) {
-            int bx = 4 + (i - 6) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-            if (x >= bx && x < bx + ARTOS_BTN_W) {
-                art.tool = i;
-                art.text_active = 0;
-                art.sel_active = 0;
-                art.poly_count = 0;
-                return;
-            }
-        }
-    }
-
-    /* Row C (y=42..59): tools 12-17 */
-    if (y >= 42 && y < 60) {
-        for (int i = 12; i < 18; i++) {
-            int bx = 4 + (i - 12) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-            if (x >= bx && x < bx + ARTOS_BTN_W) {
-                art.tool = i;
-                art.text_active = 0; art.sel_active = 0;
-                art.poly_count = 0; art.bezier_count = 0;
-                if (i == ARTOS_TOOL_CLONE) art.clone_src_set = 0;
-                return;
-            }
-        }
-    }
-
-    /* Row D (y=62..79): tools 18-23 */
-    if (y >= 62 && y < 80) {
-        for (int i = 18; i < ARTOS_TOOL_COUNT; i++) {
-            int bx = 4 + (i - 18) * (ARTOS_BTN_W + ARTOS_BTN_GAP);
-            if (x >= bx && x < bx + ARTOS_BTN_W) {
-                art.tool = i;
-                art.text_active = 0; art.sel_active = 0;
-                art.poly_count = 0; art.bezier_count = 0;
-                if (i == ARTOS_TOOL_CLONE) art.clone_src_set = 0;
-                return;
-            }
-        }
-    }
-
-    /* Row E (y=82..99): Undo, Clear, Size, Opacity, FG, BG, Swap, Zoom, Mirror, Grid */
-    if (y >= 82 && y < 100) {
+    /* --- TOP BAR (y < ARTOS_TOPBAR_H) --- */
+    if (y < ARTOS_TOPBAR_H) {
         /* Undo (x=4..39) */
         if (x >= 4 && x < 40) { artos_undo(); return; }
         /* Clear (x=44..79) */
@@ -7633,7 +9431,7 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
             return;
         }
         /* FG swatch (x=236..253) */
-        if (x >= 236 && x < 254) return; /* Just visual indicator */
+        if (x >= 236 && x < 254) return;
         /* BG swatch (x=258..275) */
         if (x >= 258 && x < 276) return;
         /* Swap (x=280..307) */
@@ -7651,52 +9449,107 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
         if (x >= 388 && x < 416) { art.mirror_mode = !art.mirror_mode; return; }
         /* Grid snap toggle (x=420..447) */
         if (x >= 420 && x < 448) { art.grid_snap = !art.grid_snap; return; }
+        return;
     }
 
-    /* Row F (y=102..119): AI prompt + Generate */
-    if (y >= 102 && y < 120) {
+    /* --- BOTTOM BAR (y >= ch - ARTOS_BOTTOMBAR_H) --- */
+    { int bb_y = ch - ARTOS_BOTTOMBAR_H;
+    if (y >= bb_y) {
+        int py = y - bb_y;
+        /* SV box first (x=430..473, spans both rows py=2..45) */
+        if (py >= 2 && py < 2 + ARTOS_SV_BOX_SIZE && x >= 430 && x < 430 + ARTOS_SV_BOX_SIZE) {
+            art.hsv_s = (x - 430) * 255 / (ARTOS_SV_BOX_SIZE - 1);
+            art.hsv_v = (ARTOS_SV_BOX_SIZE - 1 - (py - 2)) * 255 / (ARTOS_SV_BOX_SIZE - 1);
+            if (art.hsv_s > 255) art.hsv_s = 255;
+            if (art.hsv_v > 255) art.hsv_v = 255;
+            art.fg_color = hsv_to_rgb(art.hsv_h, art.hsv_s, art.hsv_v);
+            return;
+        }
+        /* Row 1 (py < 26): swatches + hue bar */
+        if (py < 26) {
+            if (py >= 2 && py < 16) {
+                for (int i = 0; i < ARTOS_PALETTE_COUNT; i++) {
+                    int sx = 4 + i * 16;
+                    if (x >= sx && x < sx + 14) {
+                        art.fg_color = artos_palette[i];
+                        rgb_to_hsv(art.fg_color, &art.hsv_h, &art.hsv_s, &art.hsv_v);
+                        return;
+                    }
+                }
+            }
+            if (py >= 3 && py < 3 + ARTOS_HUE_BAR_H && x >= 264 && x < 264 + ARTOS_HUE_BAR_W) {
+                art.hsv_h = (x - 264) * 360 / ARTOS_HUE_BAR_W;
+                if (art.hsv_h > 359) art.hsv_h = 359;
+                art.fg_color = hsv_to_rgb(art.hsv_h, art.hsv_s, art.hsv_v);
+                return;
+            }
+            return;
+        }
+        /* Row 2 (py >= 28): AI prompt + Gen + DrawNet + Go/Stop */
         if (x >= 26 && x < 306) {
             art.ai_input_active = 1;
             art.drawnet_input_active = 0;
             art.text_active = 0;
-            clicked_ai = 1;
             return;
         }
         if (x >= 312 && x < 368) {
-            generate_ai_art();
-            art.ai_input_active = 0;
+            if (!art.groq_pending) {
+                generate_ai_art();
+                art.ai_input_active = 0;
+            }
             return;
         }
-    }
-
-    /* Row G (y=120..131): DrawNet session + Go/Stop */
-    if (y >= 120 && y < ARTOS_TOOLBAR_H) {
-        if (x >= 32 && x < 112) {
+        if (x >= 410 && x < 474) {
             art.drawnet_input_active = 1;
             art.ai_input_active = 0;
             art.text_active = 0;
-            clicked_dn = 1;
             return;
         }
-        if (x >= 118 && x < 154) {
-            if (art.drawnet_enabled) {
+        if (x >= 480 && x < 516) {
+            if (art.drawnet_enabled)
                 drawnet_stop_session();
-            } else {
-                if (art.drawnet_input[0])
-                    drawnet_init_session(art.drawnet_input);
-            }
+            else if (art.drawnet_input[0])
+                drawnet_init_session(art.drawnet_input);
             art.drawnet_input_active = 0;
             return;
         }
+        if (x >= 520 && x < 576) {
+            artos_export_bmp();
+            return;
+        }
+        return;
+    } }
+
+    /* Deactivate text fields for non-bar clicks */
+    art.ai_input_active = 0;
+    art.drawnet_input_active = 0;
+
+    /* --- LEFT TOOL SIDEBAR (x < ARTOS_SIDEBAR_W) --- */
+    if (x < ARTOS_SIDEBAR_W) {
+        int sy = y - ARTOS_TOPBAR_H;
+        int ti = 0, by = 4;
+        for (int g = 0; g < 5; g++) {
+            if (g > 0) by += 3;
+            int gsz = sidebar_group_sizes[g];
+            for (int j = 0; j < gsz; j++) {
+                if (x >= 2 && x < 2 + ARTOS_TBTN_W &&
+                    sy >= by && sy < by + ARTOS_TBTN_H) {
+                    art.tool = sidebar_tool_order[ti];
+                    art.text_active = 0; art.sel_active = 0;
+                    art.poly_count = 0; art.bezier_count = 0;
+                    if (art.tool == ARTOS_TOOL_CLONE) art.clone_src_set = 0;
+                    return;
+                }
+                ti++;
+                by += ARTOS_TBTN_H + ARTOS_TBTN_GAP;
+            }
+        }
+        return;
     }
 
-    /* Deactivate text fields if not clicked */
-    if (!clicked_ai) art.ai_input_active = 0;
-    if (!clicked_dn) art.drawnet_input_active = 0;
-
     /* === Layer panel clicks (right side) === */
-    int ca_y = ARTOS_TOOLBAR_H;
-    int ca_h = ch - ARTOS_TOOLBAR_H - ARTOS_PALETTE_H;
+    int ca_y = ARTOS_TOPBAR_H;
+    int ca_h = ch - ARTOS_TOPBAR_H - ARTOS_BOTTOMBAR_H;
     if (x >= cp_w && y >= ca_y && y < ca_y + ca_h) {
         int lx = x - cp_w; /* local x within panel */
         int ly = y - ca_y; /* local y within panel */
@@ -7719,7 +9572,7 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
         /* Add layer button */
         if (art.layer_count < ARTOS_MAX_LAYERS) {
             int aby = 22 + art.layer_count * 24 + 4;
-            if (ly >= aby && ly < aby + 16 && lx >= 4 && lx < 56) {
+            if (ly >= aby && ly < aby + 16 && lx >= 4 && lx < 68) {
                 int nl = art.layer_count;
                 art.layer_count++;
                 art.layers[nl].visible = 1;
@@ -7737,7 +9590,7 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
         /* Flatten button */
         if (art.layer_count > 1) {
             int fby = 22 + ARTOS_MAX_LAYERS * 24 + 8;
-            if (ly >= fby && ly < fby + 16 && lx >= 4 && lx < 56) {
+            if (ly >= fby && ly < fby + 16 && lx >= 4 && lx < 68) {
                 artos_flatten_layers();
                 return;
             }
@@ -7785,7 +9638,9 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
                    art.tool == ARTOS_TOOL_FILLRECT || art.tool == ARTOS_TOOL_ELLIPSE ||
                    art.tool == ARTOS_TOOL_RNDRECT || art.tool == ARTOS_TOOL_CIRCLE ||
                    art.tool == ARTOS_TOOL_STAR || art.tool == ARTOS_TOOL_ARROW ||
-                   art.tool == ARTOS_TOOL_GRADFILL) {
+                   art.tool == ARTOS_TOOL_GRADFILL ||
+                   art.tool == ARTOS_TOOL_FILLOVAL || art.tool == ARTOS_TOOL_FILLSTAR ||
+                   art.tool == ARTOS_TOOL_SPIRAL) {
             artos_undo_push();
             memcpy(art.shape_save, layer_px,
                    sizeof(uint32_t) * ARTOS_CANVAS_W * ARTOS_CANVAS_H);
@@ -7903,6 +9758,14 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
             art.drawing = 1;
             art.last_cx = cx_coord; art.last_cy = cy_coord;
             art.modified = 1;
+        } else if (art.tool == ARTOS_TOOL_BLUR) {
+            artos_undo_push();
+            artos_blur_plot(cx_coord, cy_coord, art.brush_size);
+            if (art.mirror_mode)
+                artos_blur_plot(ARTOS_CANVAS_W-1-cx_coord, cy_coord, art.brush_size);
+            art.drawing = 1;
+            art.last_cx = cx_coord; art.last_cy = cy_coord;
+            art.modified = 1;
         } else if (art.tool == ARTOS_TOOL_SELECT) {
             if (art.sel_active &&
                 cx_coord >= art.sel_x1 && cx_coord < art.sel_x2 &&
@@ -7923,41 +9786,6 @@ static void artos_click(struct wm_window *win, int x, int y, int button)
         return;
     }
 
-    /* === Bottom palette clicks === */
-    int pal_y = ch - ARTOS_PALETTE_H;
-    if (y >= pal_y) {
-        int py = y - pal_y;
-
-        /* 16 quick swatches: x=4.., 14px wide, 2px gap, y offset 4 */
-        if (py >= 4 && py < 18) {
-            for (int i = 0; i < ARTOS_PALETTE_COUNT; i++) {
-                int sx = 4 + i * (14 + 2);
-                if (x >= sx && x < sx + 14) {
-                    art.fg_color = artos_palette[i];
-                    rgb_to_hsv(art.fg_color, &art.hsv_h, &art.hsv_s, &art.hsv_v);
-                    return;
-                }
-            }
-        }
-
-        /* HSV Hue bar: x=280..407, y=pal_y+4..pal_y+15 */
-        if (py >= 4 && py < 4 + ARTOS_HUE_BAR_H && x >= 280 && x < 280 + ARTOS_HUE_BAR_W) {
-            art.hsv_h = (x - 280) * 360 / ARTOS_HUE_BAR_W;
-            if (art.hsv_h > 359) art.hsv_h = 359;
-            art.fg_color = hsv_to_rgb(art.hsv_h, art.hsv_s, art.hsv_v);
-            return;
-        }
-
-        /* SV box: x=416..447, y=pal_y+4..pal_y+35 */
-        if (py >= 4 && py < 4 + ARTOS_SV_BOX_SIZE && x >= 416 && x < 416 + ARTOS_SV_BOX_SIZE) {
-            art.hsv_s = (x - 416) * 255 / (ARTOS_SV_BOX_SIZE - 1);
-            art.hsv_v = (ARTOS_SV_BOX_SIZE - 1 - (py - 4)) * 255 / (ARTOS_SV_BOX_SIZE - 1);
-            if (art.hsv_s > 255) art.hsv_s = 255;
-            if (art.hsv_v > 255) art.hsv_v = 255;
-            art.fg_color = hsv_to_rgb(art.hsv_h, art.hsv_s, art.hsv_v);
-            return;
-        }
-    }
 }
 
 /* Key handler */
@@ -7993,8 +9821,10 @@ static void artos_key(struct wm_window *win, int key)
     /* AI prompt input mode */
     if (art.ai_input_active) {
         if (key == '\n' || key == '\r') {
-            generate_ai_art();
-            art.ai_input_active = 0;
+            if (!art.groq_pending) {
+                generate_ai_art();
+                art.ai_input_active = 0;
+            }
             return;
         } else if (key == '\b' || key == 127) {
             int len = 0;
@@ -8094,6 +9924,7 @@ static void artos_key(struct wm_window *win, int key)
     if (key == 'P') { artos_undo_push(); artos_posterize(); art.modified = 1; return; }
     if (key == 'M') { art.mirror_mode = !art.mirror_mode; return; }
     if (key == 'G') { art.grid_snap = !art.grid_snap; return; }
+    if (key == 'E') { artos_export_bmp(); return; }
 
     /* Swap FG/BG */
     if (key == 'x') {
@@ -9119,7 +10950,7 @@ static void launch_network(void)
 static void launch_artos(void)
 {
     if (artos_win > 0) return;
-    artos_win = wm_create_window(60, 20, 680, 580, "ArtOS - Digital Art Studio v2");
+    artos_win = wm_create_window(60, 20, 680, 580, "ArtOS v3");
     if (artos_win > 0) {
         wm_set_on_close(artos_win, desktop_on_close);
         wm_set_on_paint(artos_win, artos_paint);
@@ -10131,6 +11962,9 @@ void desktop_init(kgeofs_volume_t *vol)
     /* Disable framebuffer console so desktop controls rendering */
     fbcon_disable();
 
+    /* Initialize COM2 serial for Groq AI proxy */
+    groq_serial_init();
+
     /* Initialize window manager (for popup windows) */
     wm_init();
 
@@ -10227,7 +12061,18 @@ void desktop_run(void)
             }
         }
 
-        /* 3d. Periodic Governor scan (every ~5 seconds = 500 ticks) */
+        /* 3d. Poll Groq AI response (async VirtIO Console) */
+        if (art.groq_pending) {
+            groq_poll_response();
+            if (art.groq_pending && timer_get_ms() - art.groq_send_ms > 5000) {
+                /* 5-second timeout: fall back to local AI */
+                art.groq_pending = 0;
+                strcpy(art.groq_status, "Timeout");
+                generate_ai_art_local();
+            }
+        }
+
+        /* 3e. Periodic Governor scan (every ~5 seconds = 500 ticks) */
         {
             uint64_t now_t = timer_get_ticks();
             if (now_t - gov_last_scan_ticks >= 500) {
